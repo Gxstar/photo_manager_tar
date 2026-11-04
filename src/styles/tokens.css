@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+/*
+ * 设计变量（docs/开发方案.md §6）
+ * Tailwind 4 @theme：--color-xxx 生成 bg-xxx / text-xxx / border-xxx 工具类
+ */
+@theme {
+  --color-app: #f5f2ed;          /* 应用底色：暖米灰 */
+  --color-surface: #ffffff;      /* 卡片 */
+  --color-subtle: #faf8f4;       /* 表头 / 次级区块 */
+  --color-hover: #efeae2;        /* 悬停 */
+  --color-line: #e5dfd5;         /* 常规描边 */
+  --color-line-strong: #d6cdc0;  /* 强描边 */
+  --color-ink: #2e2a24;          /* 主文字：暖黑 */
+  --color-ink-2: #7b7367;        /* 次级文字 */
+  --color-ink-3: #a9a196;        /* 弱化文字 */
+  --color-amber: #f59e0b;        /* 琥珀强调 */
+  --color-amber-deep: #d98207;   /* 琥珀悬停 */
+  --color-amber-soft: #fef4e2;   /* 琥珀浅底 */
+  --color-ok: #6e9b78;           /* 已存在：低饱和绿 */
+  --color-ok-soft: #edf4ee;
+  --color-info: #7e8c99;         /* 中性：灰蓝 */
+  --color-info-soft: #edf1f5;
+  --color-warn: #c99a3e;         /* 警告 */
+  --color-warn-soft: #fbf3e0;
+  --color-bad: #c25b4e;          /* 冲突 / 失败：低饱和红 */
+  --color-bad-soft: #faedea;
+  --radius-card: 14px;
+  --shadow-card: 0 1px 2px rgb(46 42 36 / 0.04), 0 4px 16px rgb(46 42 36 / 0.06);
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  @apply bg-app text-ink antialiased;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* 细滚动条（Windows WebView 默认滚动条太重） */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
