@@ -56,6 +56,23 @@ fn rw2_embedded_exif_matches_jpg() {
     assert_eq!(t_rw2, t_jpg, "RW2 与同名 JPG 时间必须一致");
 }
 
+/// R-02 配套：JPG 分辨率取自 EXIF sub-IFD 的 0xA002/0xA003（Context::Exif）。
+/// 回归：曾用 Context::Tiff 查询导致 JPG 分辨率恒为「—」（RW2 走松下私有 tag 不受影响）。
+#[test]
+fn jpg_exif_resolution_parsed() {
+    let Some(fix_jpg) = fixture(r"原图\2026\2026-10\PLUM6295.JPG") else {
+        skip_msg();
+        return;
+    };
+    if !fix_jpg.exists() {
+        skip_msg();
+        return;
+    }
+    let e = crate::meta::photo::photo_exif(&fix_jpg).expect("JPG 应可解析 EXIF");
+    assert_eq!(e.width, Some(5184), "ExifImageWidth 应从 EXIF sub-IFD 取到");
+    assert_eq!(e.height, Some(3888), "ExifImageHeight 应从 EXIF sub-IFD 取到");
+}
+
 /// R-03：MP4 mvhd 1904 纪元换算
 #[test]
 fn mp4_mvhd_uses_1904_epoch() {
@@ -258,4 +275,223 @@ fn renamed_file_in_library_is_skipped() {
     assert_eq!(plan.suspect_files, 1);
 
     let _ = std::fs::remove_dir_all(&lib);
+}
+
+/// 三态判定（新语义）：判重对象是「快门产物是否已落库」，与库内后续编辑无关。
+/// 库内编辑放大 / 裁剪缩小（尾部完整）→ 已存在；
+/// 残缺半截（强杀残留特征：无 EOI）与非 JPEG 更小 → 冲突。
+#[test]
+fn stat_target_recognizes_edited_files() {
+    let dir = std::env::temp_dir().join(format!("sdi-stat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let big = synth_jpeg(&dir, "big.jpg", 128, 96);
+    let small = synth_jpeg(&dir, "small.jpg", 32, 32);
+    let big_len = std::fs::metadata(&big).unwrap().len();
+    let small_len = std::fs::metadata(&small).unwrap().len();
+    assert_ne!(big_len, small_len);
+
+    use crate::models::FileStatus as FS;
+    use crate::scanner::stat_target;
+
+    // 等大 / 库内更大（评分 XMP、编辑放大）→ 已存在
+    assert_eq!(stat_target(&big, big_len), FS::Exists);
+    assert_eq!(stat_target(&big, small_len), FS::Exists);
+    // 库内更小但 JPEG 尾部完整（裁剪 16:9 场景）→ 已存在
+    assert_eq!(stat_target(&small, big_len), FS::Exists);
+
+    // 残缺半截（截断，无 EOI）→ 冲突（强杀残留兜底）
+    let truncated = dir.join("truncated.jpg");
+    let half = &std::fs::read(&big).unwrap()[..(big_len as usize / 2)];
+    std::fs::write(&truncated, half).unwrap();
+    assert_eq!(stat_target(&truncated, big_len), FS::Conflict);
+
+    // 非 JPEG 更小（视频/RAW 不会被原地编辑，更小只可能是残留）→ 冲突
+    let raw = dir.join("P1234567.RW2");
+    std::fs::write(&raw, b"small").unwrap();
+    assert_eq!(stat_target(&raw, big_len), FS::Conflict);
+
+    // 目标不存在 → 新增
+    assert_eq!(stat_target(&dir.join("nope.jpg"), 100), FS::New);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── 图库模块 ─────────────────────────────────────────────────────────────
+
+/// 临时目录里造一张合成 JPEG（image crate 直写，无 EXIF）
+fn synth_jpeg(dir: &std::path::Path, name: &str, w: u32, h: u32) -> PathBuf {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb([180, 120, 40]));
+    let path = dir.join(name);
+    img.save_with_format(&path, image::ImageFormat::Jpeg).unwrap();
+    path
+}
+
+/// G-01：Shell 缩略图生成（真实 COM 调用）+ 磁盘缓存命中
+#[test]
+fn shell_thumbnail_generates_and_caches() {
+    let dir = std::env::temp_dir().join(format!("sdi-thumb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let jpg = synth_jpeg(&dir, "sample.jpg", 640, 400);
+
+    let meta = std::fs::metadata(&jpg).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // 首次：走 COM 生成
+    let bytes = crate::thumbs::create(&jpg, mtime, meta.len()).expect("JPEG 应能生成 Shell 缩略图");
+    assert!(bytes.len() > 500, "应产出实质 JPEG 内容，实际 {} 字节", bytes.len());
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8], "必须是 JPEG 魔数");
+
+    // 缓存文件已落盘
+    let cache_file = crate::thumbs::cache_dir().join(crate::thumbs::cache_key(&jpg, mtime, meta.len()));
+    assert!(cache_file.exists(), "缓存文件应存在");
+
+    // 二次：直接命中缓存（清掉源文件也能命中，证明没再走 COM）
+    std::fs::remove_file(&jpg).unwrap();
+    let cached = crate::thumbs::lookup(&jpg, mtime, meta.len()).expect("二次应命中缓存");
+    assert_eq!(cached, bytes, "缓存内容应与首次生成一致");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// G-02：缓存键对 (路径, mtime, size) 敏感——文件变更自动失效
+#[test]
+fn thumb_cache_key_changes_with_metadata() {
+    let dir = std::env::temp_dir().join(format!("sdi-thumbkey-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let jpg = synth_jpeg(&dir, "key.jpg", 64, 48);
+    let k1 = crate::thumbs::cache_key(&jpg, 1000, 100);
+    let k2 = crate::thumbs::cache_key(&jpg, 2000, 100);
+    let k3 = crate::thumbs::cache_key(&jpg, 1000, 200);
+    assert_ne!(k1, k2, "mtime 变化应换键");
+    assert_ne!(k1, k3, "size 变化应换键");
+    assert_eq!(k1, crate::thumbs::cache_key(&jpg, 1000, 100), "同输入同键");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// G-03：图库列表收集体积、类别过滤（合成临时库，不碰真实库）
+#[test]
+fn gallery_list_filters_kinds() {
+    let lib = std::env::temp_dir().join(format!("sdi-glib-{}", std::process::id()));
+    let months = lib.join("原图").join("2026").join("2026-01");
+    std::fs::create_dir_all(&months).unwrap();
+    let vdir = lib.join("视频").join("2026").join("2026-01");
+    std::fs::create_dir_all(&vdir).unwrap();
+
+    synth_jpeg(&months, "a.jpg", 32, 32);
+    std::fs::write(months.join("b.RW2"), b"fake-raw").unwrap();
+    std::fs::write(months.join("b.xmp"), b"sidecar").unwrap(); // 应排除
+    std::fs::write(months.join("desktop.ini"), b"sys").unwrap(); // 应排除
+    std::fs::write(months.join("note.txt"), b"unknown").unwrap(); // 应排除
+    std::fs::write(vdir.join("c.mp4"), b"fake-video").unwrap(); // 应收录
+
+    let cfg = crate::models::AppConfig {
+        library_root: lib.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let items = crate::gallery::list_items(&cfg).expect("列表应成功");
+    let mut names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["a.jpg", "b.RW2", "c.mp4"], "只收 Image/Raw/Video");
+    assert!(items.iter().all(|i| i.shoot_time.is_none()), "列表阶段不读时间");
+
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+/// G-04（真实库夹具）：gallery::read_time 与已实测的 EXIF/mvhd 基准一致；
+/// gallery::info 拿到相机制造商/型号；video_dimensions 拿到合理分辨率
+#[test]
+fn gallery_time_and_info_match_fixtures() {
+    let Some(fix_rw2) = fixture(r"原图\2026\2026-10\P1244659.RW2") else {
+        skip_msg();
+        return;
+    };
+    let Some(fix_mp4) = fixture(r"视频\2026\2026-10\P1244742.MP4") else {
+        skip_msg();
+        return;
+    };
+    if !fix_rw2.exists() || !fix_mp4.exists() {
+        skip_msg();
+        return;
+    }
+
+    let t = crate::gallery::read_time(&fix_rw2, FileKind::Raw).expect("RW2 应解析出拍摄时间");
+    assert_eq!(t, "2026-10-02 20:42:37");
+
+    let t = crate::gallery::read_time(&fix_mp4, FileKind::Video).expect("MP4 应解析出拍摄时间");
+    assert_eq!(t, "2026-10-07 14:57:08");
+
+    let info = crate::gallery::info(&fix_rw2.to_string_lossy(), FileKind::Raw);
+    assert_eq!(info.shoot_time.as_deref(), Some("2026-10-02 20:42:37"));
+    let make = info.make.as_deref().unwrap_or("").to_lowercase();
+    assert!(make.contains("panasonic"), "RW2 应含 Panasonic Make，实际 {:?}", info.make);
+    assert!(info.model.is_some(), "RW2 应解析出机型");
+    assert!(info.width.unwrap_or(0) >= 1000 && info.height.unwrap_or(0) >= 700, "RW2 传感器尺寸应合理，实际 {:?}", (info.width, info.height));
+
+    let info = crate::gallery::info(&fix_mp4.to_string_lossy(), FileKind::Video);
+    assert_eq!(info.shoot_time.as_deref(), Some("2026-10-07 14:57:08"));
+    let (w, h) = (info.width.unwrap_or(0), info.height.unwrap_or(0));
+    assert!(w >= 640 && h >= 360, "视频分辨率应合理，实际 {}x{}", w, h);
+}
+
+/// G-05（整库冒烟，`cargo test -- --ignored` 手动触发）：
+/// 真实媒体库全量列表 + 时间读取抽样计时，只读。
+#[test]
+#[ignore]
+fn gallery_full_library_smoke() {
+    let Some(root) = fixture_root() else {
+        skip_msg();
+        return;
+    };
+    let cfg = crate::models::AppConfig {
+        library_root: root.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+
+    let t0 = std::time::Instant::now();
+    let items = crate::gallery::list_items(&cfg).expect("整库列表应成功");
+    let list_secs = t0.elapsed().as_secs_f64();
+
+    let by_kind = |k: FileKind| items.iter().filter(|i| i.kind == k).count();
+    let total_bytes: u64 = items.iter().map(|i| i.size).sum();
+    eprintln!(
+        "整库列表 {:.2}s：{} 项（照片 {} / RAW {} / 视频 {}），共 {}",
+        list_secs,
+        items.len(),
+        by_kind(FileKind::Image),
+        by_kind(FileKind::Raw),
+        by_kind(FileKind::Video),
+        format_bytes(total_bytes),
+    );
+
+    // 时间读取抽样：前 30 个（含 RW2/JPG/MP4 混合），统计耗时与成功率
+    let sample: Vec<_> = items.iter().take(30).map(|i| (i.path.clone(), i.kind)).collect();
+    let t1 = std::time::Instant::now();
+    let mut ok = 0;
+    for (path, kind) in &sample {
+        if crate::gallery::read_time(std::path::Path::new(path), *kind).is_some() {
+            ok += 1;
+        }
+    }
+    let per_file_ms = t1.elapsed().as_secs_f64() * 1000.0 / sample.len() as f64;
+    eprintln!(
+        "时间抽样 30 项：成功 {}，均耗 {:.1}ms/项 → 全库约 {:.0}s",
+        ok,
+        per_file_ms,
+        per_file_ms * items.len() as f64 / 1000.0
+    );
+    assert!(ok >= 25, "抽样成功率过低：{ok}/30");
+}
+
+fn format_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", n as f64 / (1024 * 1024 * 1024) as f64)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024 * 1024) as f64)
+    }
 }

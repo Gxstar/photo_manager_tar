@@ -2,9 +2,9 @@ use crate::error::{AppError, AppResult};
 use crate::models::AppConfig;
 use std::path::PathBuf;
 
-/// 配置文件路径：%APPDATA%\com.gengx.sdcard-importer\config.json
+/// 配置文件路径：%APPDATA%\com.gengx.develop\config.json
 fn config_path() -> PathBuf {
-    let dir = dirs_data_dir().join("com.gengx.sdcard-importer");
+    let dir = dirs_data_dir().join("com.gengx.develop");
     std::fs::create_dir_all(&dir).ok();
     dir.join("config.json")
 }

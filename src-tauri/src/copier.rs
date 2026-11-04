@@ -63,7 +63,24 @@ impl RateMeter {
 
 /// 拷贝执行入口：在 blocking 线程池里顺序拷贝全部 New 文件。
 /// 单文件失败重试 1 次，仍失败记录并继续。
-pub fn run_copy(plan: CopyPlan, control: Arc<CopyControl>, channel: Channel<CopyEvent>) {
+/// 一次拷贝的汇总结果（供导入日志落库；事件通道仍负责 UI 实时推送）
+#[derive(Debug, Clone, Default)]
+pub struct CopySummary {
+    pub cancelled: bool,
+    pub copied: usize,
+    pub failed: usize,
+    /// 实际写入字节数
+    pub bytes_copied: u64,
+    pub elapsed_secs: u64,
+    pub avg_bytes_per_sec: u64,
+    pub failures: Vec<(String, String)>,
+}
+
+pub fn run_copy(
+    plan: CopyPlan,
+    control: Arc<CopyControl>,
+    channel: Channel<CopyEvent>,
+) -> CopySummary {
     let started = Instant::now();
     let new_files: Vec<_> = plan
         .files
@@ -86,12 +103,14 @@ pub fn run_copy(plan: CopyPlan, control: Arc<CopyControl>, channel: Channel<Copy
     let mut failed: usize = 0;
     let mut last_report = Instant::now() - REPORT_INTERVAL;
     let mut pause_announced = false;
+    let mut cancelled = false;
+    let mut failures: Vec<(String, String)> = Vec::new();
 
-    for f in &new_files {
-        // 取消：立即退出（已拷文件天然保留，重扫幂等）
+    'outer: for f in &new_files {
+        // 取消：跳出主循环（已拷文件天然保留，重扫幂等）
         if control.cancel.load(Ordering::Relaxed) {
-            let _ = channel.send(CopyEvent::Cancelled);
-            return;
+            cancelled = true;
+            break 'outer;
         }
         // 暂停：轮询等待，恢复后继续
         while control.pause.load(Ordering::Relaxed) {
@@ -100,8 +119,8 @@ pub fn run_copy(plan: CopyPlan, control: Arc<CopyControl>, channel: Channel<Copy
                 pause_announced = true;
             }
             if control.cancel.load(Ordering::Relaxed) {
-                let _ = channel.send(CopyEvent::Cancelled);
-                return;
+                cancelled = true;
+                break 'outer;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -130,9 +149,11 @@ pub fn run_copy(plan: CopyPlan, control: Arc<CopyControl>, channel: Channel<Copy
             Err(e) => {
                 failed += 1;
                 done_files += 1;
+                let reason = e.to_string();
+                failures.push((f.file_name.clone(), reason.clone()));
                 let _ = channel.send(CopyEvent::FileFailed {
                     file_name: f.file_name.clone(),
-                    reason: e.to_string(),
+                    reason,
                 });
             }
         }
@@ -159,13 +180,27 @@ pub fn run_copy(plan: CopyPlan, control: Arc<CopyControl>, channel: Channel<Copy
     }
 
     let elapsed = started.elapsed().as_secs().max(1);
-    let _ = channel.send(CopyEvent::Finished {
+    let avg_bytes_per_sec = done_bytes / elapsed;
+    if cancelled {
+        let _ = channel.send(CopyEvent::Cancelled);
+    } else {
+        let _ = channel.send(CopyEvent::Finished {
+            copied,
+            skipped: 0,
+            failed,
+            elapsed_secs: elapsed,
+            avg_bytes_per_sec,
+        });
+    }
+    CopySummary {
+        cancelled,
         copied,
-        skipped: 0,
         failed,
+        bytes_copied: done_bytes,
         elapsed_secs: elapsed,
-        avg_bytes_per_sec: done_bytes / elapsed,
-    });
+        avg_bytes_per_sec,
+        failures,
+    }
 }
 
 /// 单文件拷贝：create_new 独占创建目标 + 分块直写 + sync_all。

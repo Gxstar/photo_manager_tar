@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "sdcard-importer",
+  "productName": "显影",
   "version": "0.1.0",
-  "identifier": "com.gengx.sdcard-importer",
+  "identifier": "com.gengx.develop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "SD 卡拷贝整理",
+        "title": "显影",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
