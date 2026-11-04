@@ -2,7 +2,7 @@
 //!
 //! 表 `meta_cache`：(path, mtime) → (shoot_time, rating)。行存在即「已探测」：
 //! - shoot_time NULL = 探测过但该文件无权威时间
-//! - rating NULL = 非 JPEG（不适用）；0 = JPEG 已确认无评分；1-5 = 评分
+//! - rating NULL = 不可评分格式（不适用）；0 = 可评分格式已确认无评分；1-5 = 评分
 //!
 //! 生命周期：应用启动 `open` + `load_all` 灌入进程内缓存；补齐批次与打分
 //! 成功后 UPSERT 回写。打开失败时降级为纯内存模式（写入 no-op），不阻塞应用。
@@ -321,9 +321,9 @@ mod tests {
         assert_eq!(times.get("b.RW2"), Some(&(200, Some("2026-02-02 11:00:00".into()))));
         // 清除后 = 已探测无评分（0 → None）
         assert_eq!(ratings.get("a.jpg"), Some(&(300, None)));
-        // RW2 现在也可评分：None → 0（已探测无评分），进入评分缓存
-        assert_eq!(ratings.get("b.RW2"), Some(&(200, None)));
-        // 视频等不可评分类型写 NULL，不进评分缓存
+        // 厂商 RAW 已明确不支持评分：写 NULL，不进评分缓存（拍摄时间仍照常缓存）
+        assert!(!ratings.contains_key("b.RW2"));
+        // 视频等不可评分类型同样写 NULL
         assert!(!ratings.contains_key("c.mp4"));
         let _ = std::fs::remove_dir_all(dir);
     }

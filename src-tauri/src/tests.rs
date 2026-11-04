@@ -538,67 +538,6 @@ fn rating_write_keeps_mtime() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// RAW（TIFF 容器）评分写文件内嵌 XMP：原地改 1 个字节。
-/// 这条测试锁住三个不变量——文件大小不变、只有 rating 那一位变化、
-/// mtime 不变；任何一个破了都说明「改评分不影响其他」的承诺失效。
-#[test]
-fn raw_rating_writes_in_place() {
-    let Some(src) = fixture(r"原图\2026\2026-10\P1244659.RW2") else {
-        skip_msg();
-        return;
-    };
-    if !src.exists() {
-        skip_msg();
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("sdi-rawrate-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let rw2 = dir.join("t.RW2");
-    std::fs::copy(&src, &rw2).unwrap();
-
-    // 只比头部 64KB：XMP 位于 1323 字节附近，够覆盖
-    const HEAD: usize = 64 * 1024;
-    let head_before = std::fs::read(&rw2).unwrap();
-    let head_before = &head_before[..HEAD.min(head_before.len())];
-    let len_before = std::fs::metadata(&rw2).unwrap().len();
-    let mtime_before = std::fs::metadata(&rw2).unwrap().modified().unwrap();
-
-    assert_eq!(crate::meta::xmp::rating(&rw2), None, "相机预写 0 = 未评分");
-
-    std::thread::sleep(Duration::from_millis(1100)); // 让 mtime 有变化空间
-    crate::meta::xmp::write_raw_rating(&rw2, 4).expect("RAW 评分写入应成功");
-
-    assert_eq!(crate::meta::xmp::rating(&rw2), Some(4), "写入后应读回 4");
-
-    let all_after = std::fs::read(&rw2).unwrap();
-    assert_eq!(all_after.len() as u64, len_before, "原地写不得改变文件大小");
-
-    let head_after = &all_after[..HEAD.min(all_after.len())];
-    let diff: Vec<usize> = head_before
-        .iter()
-        .zip(head_after.iter())
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(diff.len(), 1, "头部只应有 1 个字节变化，实际 {:?}", diff);
-    assert_eq!(head_after[diff[0]], b'4', "变化的字节应是评分值");
-
-    let mtime_after = std::fs::metadata(&rw2).unwrap().modified().unwrap();
-    assert_eq!(mtime_after, mtime_before, "RAW 打分后 mtime 必须不变");
-
-    // 清除评分回到 0（读回 None）
-    crate::meta::xmp::write_raw_rating(&rw2, 0).expect("清除评分应成功");
-    assert_eq!(crate::meta::xmp::rating(&rw2), None);
-    assert_eq!(
-        std::fs::read(&rw2).unwrap().len() as u64,
-        len_before,
-        "清除评分同样不得改变文件大小"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// G-07：侧边栏统计口径必须等于图库项数（原图 + 视频里的 image/raw/video）。
 /// 成片、sidecar、desktop.ini 都不计入——否则侧边栏和图库两个数字对不上。
 #[test]

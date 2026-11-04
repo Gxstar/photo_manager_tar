@@ -29,7 +29,7 @@ pub struct GalleryItem {
     pub size: u64,
     pub mtime_secs: i64,
     pub shoot_time: Option<String>,
-    /// XMP 评分 1-5（仅 JPEG；None = 无评分或不支持）
+    /// XMP 评分 1-5（仅可评分格式；None = 无评分或不支持）
     pub rating: Option<u8>,
 }
 
@@ -64,6 +64,8 @@ pub struct GalleryInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub rating: Option<u8>,
+    /// 是否真的存在可写入的内嵌 XMP 评分位（能力探测，供信息栏灰显）
+    pub rating_writable: bool,
     /// 光圈值 f/N
     pub f_number: Option<f64>,
     /// 曝光时间（分子/分母），前端按 num<den 显示 1/N
@@ -211,8 +213,8 @@ pub fn fill_meta(
     );
 }
 
-/// 单文件元数据解析。JPEG/RW2 一次读头部 128KB，时间与评分共用同一段字节；
-/// 视频 mvhd 位于 moov（可能在文件尾部），走原全文件路径。
+/// 单文件元数据解析。JPEG 一次读头部 128KB，时间与评分共用同一段字节；
+/// 厂商 RAW 只读拍摄时间、不读评分（已明确不支持）；视频 mvhd 走全文件路径。
 fn parse_meta(p: &PendingItem) -> TimePatch {
     let path = Path::new(&p.path);
     let mut shoot_time = p.cached_time.clone();
@@ -238,6 +240,7 @@ fn parse_meta(p: &PendingItem) -> TimePatch {
                     // 头部解析失败 fallback 全文件（个别 EXIF 链超出头部范围）
                     .or_else(|| read_time(path, p.kind));
             }
+            // 收窄后只有 JPEG / AVIF·HEIC 会进这里；厂商 RAW 的评分一律为 None
             rating = if xmp::is_ratable(path) {
                 if bmff {
                     crate::meta::bmff::rating(path)
@@ -283,7 +286,10 @@ pub fn read_time(path: &Path, kind: FileKind) -> Option<String> {
 pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
     let p = PathBuf::from(path);
     // 评分：按需现读保证权威（BMFF 需要解析 iloc 定点读，不能扫头部）
-    let rating = xmp::is_ratable(&p).then(|| xmp::rating_any(&p)).flatten();
+    let ratable = xmp::is_ratable(&p);
+    let rating = ratable.then(|| xmp::rating_any(&p)).flatten();
+    // 能力探测：白名单内也可能没有可写的 Rating 位（实测 3 个 AVIF 如此）
+    let rating_writable = ratable && xmp::can_write_rating(&p);
     match kind {
         FileKind::Video => {
             let (w, h) = video_dimensions(&p).unwrap_or((0, 0));
@@ -304,13 +310,14 @@ pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
                 width: e.width,
                 height: e.height,
                 rating,
+                rating_writable,
                 f_number: e.f_number,
                 exposure: e.exposure.map(|(num, den)| ExposureTime { num, den }),
                 iso: e.iso,
                 focal_length: e.focal_length,
                 focal_length_35mm: e.focal_length_35mm,
             },
-            None => GalleryInfo { rating, ..GalleryInfo::empty() },
+            None => GalleryInfo { rating, rating_writable, ..GalleryInfo::empty() },
         },
         _ => GalleryInfo::empty(),
     }
@@ -326,6 +333,7 @@ impl GalleryInfo {
             width: None,
             height: None,
             rating: None,
+            rating_writable: false,
             f_number: None,
             exposure: None,
             iso: None,

@@ -1,16 +1,13 @@
 //! AVIF / HEIC / HEIF（ISO BMFF 容器）的内嵌 XMP 评分。
 //!
-//! 三种容器的差异只是「XMP 藏在哪里」：
-//! - **JPEG**：APP1 段（`http://ns.adobe.com/xap/1.0/\0` 签名）
-//! - **TIFF 容器 RAW**：IFD 0x02BC 指向的数据区（RW2 在文件头 1.3KB 内）
-//! - **ISO BMFF**：meta → iinf 里一个 `item_type = "mime"` 的 item，
-//!   数据位置由 iloc 的 extent 给出（**绝对文件偏移 + 长度**），
-//!   实测位于 mdat 之后（文件尾部），距文件头可达数百 KB。
+//! ISO BMFF 的 XMP 在 `meta → iinf` 里一个 `item_type = "mime"` 的 item，
+//! 数据位置由 iloc 的 extent 给出（**绝对文件偏移 + 长度**），
+//! 实测位于 mdat 之后（文件尾部），距文件头可达数百 KB。
+//! 所以不能「扫文件头找 `<x:xmpmeta`」——必须先解析 iloc 拿到真实偏移再定点读。
+//! 要读的只有 meta（前几百字节）和 XMP 载荷（约 1KB）。
+//! （JPEG 在 APP1 段，见 `xmp.rs`；厂商 RAW 已明确不支持评分。）
 //!
-//! 所以不能像 TIFF 那样「扫文件头找 `<x:xmpmeta`」——必须先解析 iloc 拿到
-//! 真实偏移再定点读。要读的只有 meta（前几百字节）和 XMP 载荷（约 1KB）。
-//!
-//! 写：与 RW2 完全一致的「原地改 1 字节」——xmp:Rating 的值恒为单字符（0-5），
+//! 写：「原地改 1 字节」——xmp:Rating 的值恒为单字符（0-5），
 //! 替换前后长度相同，容器结构、盒子大小、所有 iloc 偏移、像素数据全不受影响。
 //!
 //! 实测（本机 1,398 个 AVIF）：全部有 mime item；1,396 个含
@@ -48,9 +45,20 @@ pub fn rating(path: &Path) -> Option<u8> {
     super::xmp::parse_rating(&payload)
 }
 
+/// 能力探测：是否真的存在「可原地改写」的单字符 Rating 位。
+/// 与 `write_rating` 的前置条件完全一致（同一套定位逻辑），供信息栏灰显；
+/// 无 mime item、无 rating 字段、值不是单字符都返回 false。
+pub fn can_write_rating(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let Some((abs, len)) = xmp_payload(&mut f) else { return false };
+    let Some(payload) = read_at(&mut f, abs, len) else { return false };
+    super::xmp::rating_span(&payload)
+        .is_some_and(|(s, e)| e - s == 1)
+}
+
 /// 原地写入 xmp:Rating：**只改 1 个字节**，文件长度与所有容器偏移不动。
 pub fn write_rating(path: &Path, rating: u8) -> Result<(), String> {
-    // 与 JPEG / RAW 同理：改 XMP 不改画面，mtime 不该变（否则缩略图缓存全失效）
+    // 与 JPEG 同理：改 XMP 不改画面，mtime 不该变（否则缩略图缓存全失效）
     let orig_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
 
     let mut f = std::fs::OpenOptions::new()
@@ -391,6 +399,7 @@ mod tests {
     #[test]
     fn reads_and_updates_rating() {
         let p = tmp("read", "a.avif", &build_avif(XMP));
+        assert!(can_write_rating(&p), "含单字符 Rating 的 AVIF 应可写");
         assert_eq!(rating(&p), None, "0 = 未评分");
         write_rating(&p, 4).unwrap();
         assert_eq!(rating(&p), Some(4));
@@ -433,6 +442,7 @@ mod tests {
         data.extend(bx(b"mdat", b"nothing here"));
         let p = tmp("nomime", "c.avif", &data);
         assert_eq!(rating(&p), None);
+        assert!(!can_write_rating(&p), "无 mime item 应被能力探测判为不可写");
         assert!(write_rating(&p, 3).is_err(), "无 mime item 应明确报错");
         cleanup("nomime");
     }

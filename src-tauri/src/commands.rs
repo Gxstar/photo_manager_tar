@@ -5,7 +5,7 @@ use crate::error::{AppError, AppResult};
 use crate::gallery::{self, GalleryInfo, GalleryItem, TimesEvent};
 use crate::models::{
     AppConfig, CopyEvent, CopyPlan, Device, FileKind, HomeOverview, ImportFailure, ImportLog,
-    LibraryStats, ScanEvent,
+    LibraryStats, RatingFailure, ScanEvent,
 };
 use crate::scanner;
 use crate::state::AppState;
@@ -376,16 +376,13 @@ pub fn gallery_open(path: String) -> AppResult<()> {
 
 /// 按容器类型分派写入：
 /// - JPEG：XMP 在 APP1 段，长度可能变 → 整文件重写（tmp + rename）
-/// - TIFF 容器 RAW（RW2/DNG/…）：XMP 在 IFD 数据区，值恒为单字符
-///   → 原地改 1 个字节，文件大小与所有偏移不动
-/// - AVIF/HEIF（ISO BMFF）：XMP 在 mime item 的载荷里（文件尾部），同样单字符
+/// - AVIF/HEIF（ISO BMFF）：XMP 在 mime item 的载荷里（文件尾部），值恒单字符
 ///   → 原地改 1 个字节
+/// 厂商 RAW 不支持评分；调用方已按 is_ratable 过滤，走到这里会明确报错。
 fn write_rating_for(path: &Path, value: u8) -> Result<(), String> {
     use crate::meta::{bmff, xmp};
     if xmp::is_jpeg(path) {
         xmp::write_jpeg_rating(path, value)
-    } else if xmp::is_raw(path) {
-        xmp::write_raw_rating(path, value)
     } else if bmff::is_bmff(path) {
         bmff::write_rating(path, value)
     } else {
@@ -393,14 +390,15 @@ fn write_rating_for(path: &Path, value: u8) -> Result<(), String> {
     }
 }
 
-/// 批量写入 XMP 评分（JPEG 与 RAW 均写文件内嵌 XMP；rating=None 表示清除）。
-/// 返回写入失败的「文件名: 原因」列表（空 = 全部成功）。
+/// 批量写入 XMP 评分（仅 JPEG / AVIF·HEIC，均写文件内嵌 XMP；rating=None 表示清除）。
+/// 返回失败明细（路径 + 文件名 + 原因），空 = 全部成功；
+/// 前端据此只更新真正写成功的文件，避免不可写文件被误标成已评分。
 #[tauri::command]
 pub async fn gallery_set_rating(
     paths: Vec<String>,
     rating: Option<u8>,
     app: AppHandle,
-) -> AppResult<Vec<String>> {
+) -> AppResult<Vec<RatingFailure>> {
     let value = rating.unwrap_or(0);
     if value > 5 {
         return Err(AppError::IoError("评分超出 1-5 范围".into()));
@@ -433,12 +431,15 @@ pub async fn gallery_set_rating(
                     // SQLite 持久回写
                     st.meta.upsert_rating(&p, mtime, (value > 0).then_some(value));
                 }
-                Err(e) => {
-                    let name = Path::new(&p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.clone());
-                    failed.push(format!("{name}: {e}"));
+                Err(reason) => {
+                    failed.push(RatingFailure {
+                        file_name: Path::new(&p)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| p.clone()),
+                        path: p,
+                        reason,
+                    });
                 }
             }
         }

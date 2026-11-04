@@ -244,6 +244,16 @@ pub struct ImportFailure {
     pub reason: String,
 }
 
+/// 批量评分里单个文件的写入失败明细。带 path 是为了让前端只更新成功项，
+/// 不把失败文件误标成已评分（否则「点了星却没写进去」是看不见的脏数据）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingFailure {
+    pub path: String,
+    pub file_name: String,
+    pub reason: String,
+}
+
 /// 一次拷贝记录（每次点「开始拷贝」产生一条；取消也记，`cancelled = true`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

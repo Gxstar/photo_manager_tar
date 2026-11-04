@@ -1,23 +1,19 @@
-//! JPEG / RAW 的 XMP 评分读写（xmp:Rating 标准属性，1-5 星；0 = 未评分）。
+//! JPEG 的 XMP 评分读写（xmp:Rating 标准属性，1-5 星；0 = 未评分）。
 //!
-//! 两种容器的 XMP 存放位置不同，所以读写方式也不同：
-//! - **JPEG**：XMP 在 APP1 段（"http://ns.adobe.com/xap/1.0/\0" 签名）。
-//!   写：段长度可能变 → 整体重写文件，tmp + rename 原子替换。
-//! - **RAW（TIFF 容器）**：XMP 在 IFD 的 0x02BC (XMLPacket) 指向的数据区，
-//!   实测松下 RW2 位于文件头 1323~3651 字节，相机拍时就写好了
-//!   `<xmp:Rating>0</xmp:Rating>`。写：值恒为单字符（0-5），**原地改 1 个字节**
-//!   ——文件长度、所有 TIFF 偏移、后续数据全不动，比整文件重写安全得多。
+//! JPEG 的 XMP 在 APP1 段（`http://ns.adobe.com/xap/1.0/\0` 签名）：
+//! 有包则只改其中的 Rating 属性、其余保留；无包则插入一个新 APP1 段。
+//! 段长度可能变 → 整文件重写（tmp + rename 原子替换），写后还原 mtime。
 //!
-//! 读：两者都只读文件头 128KB（与拍摄时间解析共用同一次读盘）。
+//! 读：只读文件头 128KB（与拍摄时间解析共用同一次读盘）。
+//! ISO BMFF（AVIF/HEIC）的读写在 `bmff.rs`，两者的 `rating_span` 共用。
 //!
-//! 范围（用户决策）：RAW 评分写文件内嵌 XMP，不生成 sidecar。
+//! 范围（用户决策 2026-11-05）：**只支持 JPEG 与 AVIF·HEIC·HEIF**，
+//! TIFF 容器厂商 RAW（RW2/DNG/CR2/…）一律不评分——厂商私有 IFD 偏移
+//! 与加条目要移位的风险不对等，且库内 99.9% 的非 RAW 图片已被这两种覆盖。
+//! 不生成 sidecar。
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
 use std::path::Path;
-
-/// 支持内嵌 XMP 评分的 TIFF 容器 RAW 扩展名。
-/// CR3 是 ISO BMFF 容器（XMP 在 box 里），结构不同，暂不列入。
-const RAW_EXTS: &[&str] = &["rw2", "dng", "cr2", "nef", "arw", "orf", "raf", "pef"];
 
 /// XMP 命名空间签名（APP1 载荷前缀）
 const XMP_SIG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -34,18 +30,23 @@ pub fn is_jpeg(path: &Path) -> bool {
     )
 }
 
-/// 该路径是否为 TIFF 容器 RAW（内嵌 XMP 可原地改写）
-pub fn is_raw(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .map(|e| RAW_EXTS.contains(&e.as_str()))
-        .unwrap_or(false)
+/// 是否属于可评分格式（JPEG + ISO BMFF 图片）。
+/// 厂商 RAW 一律不在此列；CR3 虽是 BMFF，但 XMP 在 uuid/CMT 盒且无样本，未列入。
+pub fn is_ratable(path: &Path) -> bool {
+    is_jpeg(path) || super::bmff::is_bmff(path)
 }
 
-/// 是否支持评分（JPEG + TIFF 容器 RAW + ISO BMFF 图片）
-pub fn is_ratable(path: &Path) -> bool {
-    is_jpeg(path) || is_raw(path) || super::bmff::is_bmff(path)
+/// 能力探测：这个文件**现在**能不能写入评分（供信息栏灰显，避免点了才报错）。
+/// JPEG 恒 true（没有 XMP 也能新建 APP1 段）；BMFF 必须真的有可原地改写的
+/// 单字符 Rating 位——没有 mime item / 没有 rating 字段 / 值不是单字符都为 false。
+pub fn can_write_rating(path: &Path) -> bool {
+    if is_jpeg(path) {
+        true
+    } else if super::bmff::is_bmff(path) {
+        super::bmff::can_write_rating(path)
+    } else {
+        false
+    }
 }
 
 /// 读评分：按容器分派（BMFF 的 XMP 在文件尾部，头部扫不到）
@@ -66,7 +67,7 @@ pub fn rating(path: &Path) -> Option<u8> {
     rating_from_head(&head)
 }
 
-/// 从文件头字节解析评分（JPEG 找 APP1，RAW 找 IFD 数据区里的 XMP 包）。
+/// 从文件头字节解析评分（JPEG 找 APP1 段）。
 /// 与拍摄时间解析共用同一次 128KB 读盘。
 pub fn rating_from_head(head: &[u8]) -> Option<u8> {
     parse_rating(xmp_in_head(head)?)
@@ -161,20 +162,13 @@ pub fn write_jpeg_rating(path: &Path, rating: u8) -> Result<(), String> {
     Ok(())
 }
 
-/// 在文件头中定位 XMP 包的字节区间（不含 <?xpacket> 外壳）。
-/// JPEG 走 APP1 段遍历；TIFF 容器直接按文本特征定位——不同厂商的 IFD
-/// 偏移基数各不相同（RW2 有私有 offset shift），解析 IFD 反而容易出错，
-/// 而 XMP 包本身就是带完整 XML 骨架的文本，定位可靠。
+/// 在 JPEG 文件头中定位 XMP 包的字节区间（不含 <?xpacket> 外壳）
 fn xmp_packet_range(head: &[u8]) -> Option<(usize, usize)> {
     if head.len() >= 4 && &head[0..2] == b"\xFF\xD8" {
-        return jpeg_xmp_range(head);
+        jpeg_xmp_range(head)
+    } else {
+        None
     }
-    let start = find_sub(head, b"<x:xmpmeta")?;
-    let rest = &head[start..];
-    let end = find_sub(rest, b"</x:xmpmeta>")
-        .map(|i| start + i + b"</x:xmpmeta>".len())
-        .unwrap_or(head.len());
-    Some((start, end))
 }
 
 /// 在文件头中取出 XMP 包切片
@@ -216,7 +210,7 @@ fn jpeg_xmp_range(head: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// 定位 xmp:Rating 值的字节区间（相对 XMP 包起点），供原地替换。
-/// TIFF 容器在文件头里用，BMFF 在 mime item 载荷里用——两者共用同一份查找逻辑。
+/// BMFF 在 mime item 载荷里用；JPEG 走文本替换，不用这个。
 pub(crate) fn rating_span(pkt: &[u8]) -> Option<(usize, usize)> {
     const ATTR: &[u8] = b"xmp:Rating=\"";
     const EL: &[u8] = b"<xmp:Rating>";
@@ -233,66 +227,11 @@ pub(crate) fn rating_span(pkt: &[u8]) -> Option<(usize, usize)> {
     (vend > vstart).then_some((vstart, vend))
 }
 
-/// 在文件头里定位 xmp:Rating 值的绝对偏移（TIFF / JPEG 容器）
-fn locate_rating_span(head: &[u8]) -> Option<(usize, usize)> {
-    let (pkt_start, pkt_end) = xmp_packet_range(head)?;
-    let pkt = head.get(pkt_start..pkt_end)?;
-    let (s, e) = rating_span(pkt)?;
-    Some((pkt_start + s, pkt_start + e))
-}
-
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// 原地写入 RAW 的内嵌 XMP 评分：**只改 1 个字节**。
-///
-/// 评分恒为单字符（0-5），替换前后长度一致，因此文件大小、所有 TIFF 偏移、
-/// 后续像素数据全部不受影响——这是 RAW 评分最安全的形态，无需重写 37MB。
-pub fn write_raw_rating(path: &Path, rating: u8) -> Result<(), String> {
-    // 与 JPEG 同理：改 XMP 不改画面，mtime 不该变（否则缩略图缓存全失效）
-    let orig_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
-
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("打开失败: {e}"))?;
-    let mut head = vec![0u8; SCAN_LEN];
-    let n = f.read(&mut head).map_err(|e| format!("读取失败: {e}"))?;
-    head.truncate(n);
-
-    let (vstart, vend) = locate_rating_span(&head).ok_or_else(|| {
-        "未找到内嵌 XMP 评分（文件不是 TIFF 结构，或相机未写入 xmp:Rating）".to_string()
-    })?;
-
-    // 0-5 恒为单字符。长度不符说明是 "4.5" 之类的非常规写法，
-    // 原地替换会改变数据区长度并破坏 TIFF 偏移 → 直接拒绝，不冒险。
-    if vend - vstart != 1 {
-        return Err(format!(
-            "XMP 评分值为 {} 字节（非 0-5 单字符），不做原地修改以免破坏文件结构",
-            vend - vstart
-        ));
-    }
-    let new_byte = b'0' + rating;
-    if head[vstart] == new_byte {
-        return Ok(()); // 已是目标值，不产生磁盘写
-    }
-
-    f.seek(SeekFrom::Start(vstart as u64)).map_err(|e| format!("定位失败: {e}"))?;
-    f.write_all(&[new_byte]).map_err(|e| format!("写入失败: {e}"))?;
-    f.flush().map_err(|e| format!("刷盘失败: {e}"))?;
-    drop(f);
-
-    if let Some(t) = orig_mtime {
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-            let _ = f.set_modified(t);
-        }
-    }
-    Ok(())
 }
 
 /// 从 XMP 包文本解析 xmp:Rating，兼容属性式与元素式；0 / 负值 / 非法 → None
@@ -469,6 +408,31 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let p = write_tmp(&dir, "c.bin", &[0x49, 0x49, 0x55, 0x00, 1, 2, 3]);
         assert!(write_jpeg_rating(&p, 3).is_err(), "非 JPEG 应拒绝写入");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户决策 2026-11-05：厂商 RAW 一律不参与评分，锁住白名单防止误加回来
+    #[test]
+    fn raw_formats_are_not_ratable() {
+        for ext in ["rw2", "dng", "cr2", "nef", "arw", "orf", "raf", "pef", "cr3"] {
+            let name = format!("photo.{ext}");
+            let p = Path::new(&name);
+            assert!(!is_ratable(p), "{ext} 不应可评分");
+            assert!(!can_write_rating(p), "{ext} 不应可写评分");
+        }
+        assert!(is_ratable(Path::new("photo.jpg")));
+        assert!(is_ratable(Path::new("photo.jpeg")));
+        assert!(is_ratable(Path::new("photo.AVIF")));
+        assert!(is_ratable(Path::new("photo.heic")));
+        assert!(is_ratable(Path::new("photo.heif")));
+    }
+
+    #[test]
+    fn jpeg_is_always_writable() {
+        let dir = std::env::temp_dir().join("xmp_test_writable");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = write_tmp(&dir, "a.jpg", &build_jpeg(None));
+        assert!(can_write_rating(&p), "JPEG 即使没有 XMP 也能新建 APP1 段");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
