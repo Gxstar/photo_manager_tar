@@ -52,15 +52,22 @@ const filterOpts = [
 
 // ── 评分筛选 ─────────────────────────────────────────────────────────────
 // 只对「可评分文件」生效（JPEG + TIFF 容器 RAW）：选「未评」时不把视频等不可评分的项
-// 混进来，否则几千个不可打分文件会把空档淹没。将来 RAW 支持 sidecar 评分，
-// 改 isRatable 一处即可。
-const ratingFilter = ref("all"); // all | picked | unrated
+// 混进来，否则几千个不可打分文件会把空档淹没。
+// 取值：all 不限 / unrated 未评 / "1".."5" = ≥N★（含 N 星，与 Lightroom 口径一致）
+const ratingFilter = ref("all");
 
-const ratingOpts = [
-  { value: "all", label: "不限" },
-  { value: "picked", label: "≥3★" },
-  { value: "unrated", label: "未评" },
-];
+const minStars = computed(() =>
+  ratingFilter.value === "all" || ratingFilter.value === "unrated" ? 0 : Number(ratingFilter.value),
+);
+
+// 点第 N 颗星 = ≥N★；再点同一颗取消回「不限」
+function setMinStars(n) {
+  ratingFilter.value = ratingFilter.value === String(n) ? "all" : String(n);
+}
+
+// 悬停预览：鼠标划过第 N 颗时先亮到 N，离开恢复实际阈值
+const hoverStars = ref(0);
+const starPreview = computed(() => hoverStars.value || minStars.value);
 
 // 可评分格式：JPEG 与 TIFF 容器 RAW（XMP 都在文件内，后端原地改写）
 // 与后端 xmp::RAW_EXTS 保持一致；视频与其他图片格式不参与评分
@@ -86,7 +93,8 @@ const displayItems = computed(() => {
     if (rating === "all") return true;
     if (!isRatable(it)) return false;
     const r = it.rating ?? 0;
-    return rating === "picked" ? r >= 3 : r === 0;
+    if (rating === "unrated") return r === 0;
+    return r >= Number(rating);
   });
 });
 
@@ -99,8 +107,8 @@ const emptyHint = computed(() => {
   const pool =
     kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
   if (!pool.some(isRatable)) return "评分筛选只对 JPG / RAW 生效，当前类型下没有可评分的文件";
-  if (ratingFilter.value === "picked") return "还没有 ≥3★ 的照片，选中后按 0-5 即可打分";
-  return "可评分的照片都已经打过分了";
+  if (ratingFilter.value === "unrated") return "可评分的照片都已经打过分了";
+  return `还没有 ≥${minStars.value}★ 的照片，选中后按 0-5 即可打分`;
 });
 
 // 切换筛选时清掉旧选择与键盘游标（跨筛选的选择集没有意义）
@@ -109,6 +117,7 @@ function resetSelection() {
   anchorIdx.value = -1;
   cursorIdx.value = -1;
   hoverRating.value = 0;
+  hoverStars.value = 0;
 }
 watch([kindFilter, ratingFilter], resetSelection);
 
@@ -746,20 +755,41 @@ function relDir(item) {
 
           <span class="h-4 w-px shrink-0 bg-line"></span>
 
-          <!-- 评分筛选：只筛可评分文件，避免不可打分的 RAW/视频淹没「未评」 -->
+          <!-- 评分筛选：只筛可评分文件，避免不可打分的视频淹没「未评」 -->
           <div
             class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
-            title="按星级筛选（只对可评分的 JPG / RAW 生效）"
+            :title="minStars ? `显示 ≥${minStars}★ 的可评分文件（再点同一颗星取消）` : '按星级筛选（只对可评分的 JPG / RAW 生效）'"
+            @mouseleave="hoverStars = 0"
           >
-            <Star class="mx-1 size-3 shrink-0 text-ink-3" />
             <button
-              v-for="opt in ratingOpts"
-              :key="opt.value"
               class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
-              :class="ratingFilter === opt.value ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
-              @click="ratingFilter = opt.value"
+              :class="ratingFilter === 'all' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+              @click="ratingFilter = 'all'"
             >
-              {{ opt.label }}
+              不限
+            </button>
+            <!-- 星级阈值：点第 N 颗 = ≥N★（含 N 星），悬停预览 -->
+            <div class="mx-0.5 flex items-center gap-px border-x border-line px-1">
+              <button
+                v-for="n in 5"
+                :key="n"
+                class="grid size-[18px] place-items-center rounded transition-colors hover:bg-hover"
+                :title="`≥${n}★`"
+                @mouseenter="hoverStars = n"
+                @click="setMinStars(n)"
+              >
+                <Star
+                  class="size-3"
+                  :class="n <= starPreview ? 'fill-amber text-amber' : 'text-ink-3'"
+                />
+              </button>
+            </div>
+            <button
+              class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
+              :class="ratingFilter === 'unrated' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+              @click="ratingFilter = 'unrated'"
+            >
+              未评
             </button>
           </div>
         </div>
