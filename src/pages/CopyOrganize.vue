@@ -1,13 +1,15 @@
 <script setup>
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { FolderSearch, RefreshCw, LoaderCircle, Play, CircleCheck, TriangleAlert, RotateCw } from "lucide-vue-next";
 import DeviceCard from "../components/DeviceCard.vue";
 import PlanTable from "../components/PlanTable.vue";
 import CopyProgress from "../components/CopyProgress.vue";
+import HomeEmpty from "../components/HomeEmpty.vue";
 import {
   store,
   refreshDevices,
+  resetHome,
   errMsg,
   formatBytes,
 } from "../store.js";
@@ -31,6 +33,39 @@ pollTimer = setInterval(() => {
   if (!store.copying && !store.scanning) refreshDevices();
 }, 3000);
 onBeforeUnmount(() => clearInterval(pollTimer));
+
+// ── 插卡自动扫描 ─────────────────────────────────────────────────────────
+// 设备轮询检测到「有卡的设备」后自动选中并扫描一次，省掉每天重复的一次点击。
+// 扫描只读卡（不做任何写入），扫描结果只是计划表，仍需手动点「开始拷贝」。
+// 标记存 store 而非组件内 ref：切页回来组件重建时不重复扫描。
+watch(
+  () => store.devices,
+  (list) => {
+    const card = list.find((d) => d.hasMedia);
+    if (!card) {
+      // 拔卡：重置自动扫描标记，旧计划随之失效（下次插卡重新扫描）
+      store.autoScannedDevice = null;
+      if (!store.copying && !store.scanning) {
+        store.plan = null;
+        store.report = null;
+      }
+      return;
+    }
+    if (!store.selectedDevice) store.selectedDevice = card.path;
+    if (store.selectedDevice !== card.path) return;
+    // 已有该卡的计划：不再自动扫（避免切页回来重扫、覆盖已拷报告）
+    if (store.plan?.devicePath === card.path) {
+      store.autoScannedDevice = card.path;
+      return;
+    }
+    if (store.config?.autoScan === false) return;
+    if (store.autoScannedDevice === card.path) return;
+    if (store.scanning || store.copying) return;
+    store.autoScannedDevice = card.path;
+    pickAndScan();
+  },
+  { immediate: true }
+);
 
 /** 异步扫描：立即返回，进度经 Channel 推送 */
 function pickAndScan() {
@@ -114,6 +149,8 @@ function onCopyEvent(msg) {
       for (const f of store.plan?.files ?? []) {
         if (f.status === "new") f.status = "copied";
       }
+      // 库内容变了：下次进入无卡空态必须重取（拔卡后展示刚导入的照片）
+      resetHome();
       break;
     case "cancelled":
       store.copying = false;
@@ -148,152 +185,150 @@ async function cancelCopy() {
 
 <template>
   <div class="flex min-h-full flex-col gap-4 p-6">
-    <!-- 设备区 -->
-    <section>
-      <div class="mb-2.5 flex items-center justify-between">
-        <h2 class="text-sm font-semibold text-ink-2">设备</h2>
-        <button
-          class="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs text-ink-2 transition-colors hover:bg-hover"
-          :disabled="store.devicesLoading || store.copying || store.scanning"
-          @click="refreshDevices"
-        >
-          <RefreshCw class="size-3.5" :class="{ 'animate-spin': store.devicesLoading }" />
-          刷新
-        </button>
-      </div>
+    <!-- 无卡：首页空态（最近导入 + 归档概况 + 入口） -->
+    <HomeEmpty v-if="!hasCard" @refresh="refreshDevices" />
 
-      <div
-        v-if="!hasCard && !store.devicesLoading"
-        class="rounded-card border border-dashed border-line bg-surface/60 px-4 py-6 text-center text-sm text-ink-3"
-      >
-        未检测到 SD 卡——插入相机卡后会自动出现
-      </div>
+    <template v-else>
+      <!-- 设备区 -->
+      <section>
+        <div class="mb-2.5 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-ink-2">设备</h2>
+          <button
+            class="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs text-ink-2 transition-colors hover:bg-hover"
+            :disabled="store.devicesLoading || store.copying || store.scanning"
+            @click="refreshDevices"
+          >
+            <RefreshCw class="size-3.5" :class="{ 'animate-spin': store.devicesLoading }" />
+            刷新
+          </button>
+        </div>
 
-      <div v-else class="flex flex-wrap gap-3">
-        <DeviceCard
-          v-for="d in store.devices"
-          :key="d.path"
-          :device="d"
-          :selected="store.selectedDevice === d.path"
-          :disabled="store.copying || store.scanning"
-          @select="store.selectedDevice = d.hasMedia ? d.path : store.selectedDevice"
-        />
-      </div>
-    </section>
-
-    <!-- 扫描 -->
-    <section v-if="selected?.hasMedia" class="flex items-center gap-3">
-      <button
-        class="flex h-9 items-center gap-2 rounded-lg bg-amber px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
-        :disabled="store.scanning || store.copying"
-        @click="pickAndScan"
-      >
-        <LoaderCircle v-if="store.scanning" class="size-4 animate-spin" />
-        <FolderSearch v-else class="size-4" />
-        {{ store.scanning ? "扫描中…" : "扫描卡片" }}
-      </button>
-      <span v-if="scanError" class="flex items-center gap-1.5 text-xs text-bad">
-        <TriangleAlert class="size-3.5" /> {{ scanError }}
-      </span>
-    </section>
-
-    <!-- 扫描进度 -->
-    <section
-      v-if="store.scanning && store.scanProgress"
-      class="rounded-card border border-line bg-surface p-4 shadow-card"
-    >
-      <div class="mb-2 flex items-baseline justify-between text-sm">
-        <span class="font-medium">
-          正在扫描 {{ store.scanProgress.done }} / {{ store.scanProgress.total }} 个文件
-        </span>
-        <span class="text-xs text-ink-3">
-          {{ Math.round((store.scanProgress.done / Math.max(1, store.scanProgress.total)) * 100) }}%
-        </span>
-      </div>
-      <div class="h-2 w-full overflow-hidden rounded-full bg-subtle">
-        <div
-          class="h-full rounded-full bg-amber transition-[width] duration-100"
-          :style="{
-            width:
-              Math.min(100, (store.scanProgress.done / Math.max(1, store.scanProgress.total)) * 100) + '%',
-          }"
-        />
-      </div>
-      <div class="mt-2 truncate text-xs text-ink-3">
-        {{ store.scanProgress.current }}
-      </div>
-    </section>
-
-    <!-- 计划预览（月份折叠卡片） -->
-    <template v-if="store.plan">
-      <section class="flex items-center gap-2">
-        <span class="text-sm font-semibold text-ink-2">归档计划</span>
-        <span class="text-xs text-ink-3">点击月份可展开明细</span>
+        <div class="flex flex-wrap gap-3">
+          <DeviceCard
+            v-for="d in store.devices"
+            :key="d.path"
+            :device="d"
+            :selected="store.selectedDevice === d.path"
+            :disabled="store.copying || store.scanning"
+            @select="store.selectedDevice = d.hasMedia ? d.path : store.selectedDevice"
+          />
+        </div>
       </section>
 
-      <PlanTable :files="store.plan.files" />
+      <!-- 扫描 -->
+      <section v-if="selected?.hasMedia" class="flex items-center gap-3">
+        <button
+          class="flex h-9 items-center gap-2 rounded-lg bg-amber px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
+          :disabled="store.scanning || store.copying"
+          @click="pickAndScan"
+        >
+          <LoaderCircle v-if="store.scanning" class="size-4 animate-spin" />
+          <FolderSearch v-else class="size-4" />
+          {{ store.scanning ? "扫描中…" : "扫描卡片" }}
+        </button>
+        <span v-if="scanError" class="flex items-center gap-1.5 text-xs text-bad">
+          <TriangleAlert class="size-3.5" /> {{ scanError }}
+        </span>
+      </section>
 
-      <!-- 底部操作条 / 进度 -->
-      <div class="sticky bottom-0 -mx-6 mt-2 border-t border-line bg-app/95 px-6 pb-4 pt-3 backdrop-blur">
-        <CopyProgress
-          v-if="store.copying && store.progress"
-          :progress="store.progress"
-          @cancel="cancelCopy"
-        />
-
-        <template v-else>
-          <!-- 完成汇总 -->
+      <!-- 扫描进度 -->
+      <section
+        v-if="store.scanning && store.scanProgress"
+        class="rounded-card border border-line bg-surface p-4 shadow-card"
+      >
+        <div class="mb-2 flex items-baseline justify-between text-sm">
+          <span class="font-medium">
+            正在扫描 {{ store.scanProgress.done }} / {{ store.scanProgress.total }} 个文件
+          </span>
+          <span class="text-xs text-ink-3">
+            {{ Math.round((store.scanProgress.done / Math.max(1, store.scanProgress.total)) * 100) }}%
+          </span>
+        </div>
+        <div class="h-2 w-full overflow-hidden rounded-full bg-subtle">
           <div
-            v-if="store.report"
-            class="mb-3 flex items-center gap-4 rounded-card border border-line bg-surface px-4 py-2.5 text-sm shadow-card"
-          >
-            <span class="flex items-center gap-1.5 text-ok">
-              <CircleCheck class="size-4" /> 拷贝完成
-            </span>
-            <span class="text-ink-2">
-              成功 {{ store.report.copied }} 个
-              <template v-if="store.report.failed"> · 失败 {{ store.report.failed }} 个</template>
-              · 用时 {{ store.report.elapsed }} 秒 · 平均 {{ formatBytes(store.report.avgBps) }}/s
-            </span>
-            <button
-              class="ml-auto flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-xs text-ink-2 hover:bg-hover"
-              @click="store.selectedDevice && pickAndScan()"
-            >
-              <RotateCw class="size-3.5" /> 再扫一次核对
-            </button>
-          </div>
+            class="h-full rounded-full bg-amber transition-[width] duration-100"
+            :style="{
+              width:
+                Math.min(100, (store.scanProgress.done / Math.max(1, store.scanProgress.total)) * 100) + '%',
+            }"
+          />
+        </div>
+        <div class="mt-2 truncate text-xs text-ink-3">
+          {{ store.scanProgress.current }}
+        </div>
+      </section>
 
-          <div v-if="copyingError" class="mb-2 text-xs text-bad">{{ copyingError }}</div>
+      <!-- 计划预览（月份折叠卡片） -->
+      <template v-if="store.plan">
+        <section class="flex items-center gap-2">
+          <span class="text-sm font-semibold text-ink-2">归档计划</span>
+          <span class="text-xs text-ink-3">点击月份可展开明细</span>
+        </section>
 
-          <div class="flex items-center gap-4">
-            <span class="text-sm text-ink-2">
-              待拷
-              <b class="text-ink">{{ store.plan.newFiles }}</b> 个文件 ·
-              {{ formatBytes(store.plan.newBytes) }}
-              <template v-if="store.plan.existsFiles">
-                · 跳过已存在 {{ store.plan.existsFiles }} 个
-              </template>
-              <template v-if="store.plan.suspectFiles">
-                · <span class="text-warn">改名跳过 {{ store.plan.suspectFiles }} 个</span>
-              </template>
-              <template v-if="store.plan.conflictFiles">
-                · <span class="text-bad">冲突 {{ store.plan.conflictFiles }} 个</span>
-              </template>
-            </span>
-            <span v-if="deficit" class="text-xs text-bad">
-              目标盘剩余 {{ formatBytes(store.plan.freeBytes) }}，还差 {{ formatBytes(deficit) }}
-            </span>
-            <button
-              class="ml-auto h-10 rounded-xl bg-amber px-6 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
-              :disabled="!store.plan.spaceOk || store.plan.newFiles === 0"
-              @click="startCopy"
+        <PlanTable :files="store.plan.files" />
+
+        <!-- 底部操作条 / 进度 -->
+        <div class="sticky bottom-0 -mx-6 mt-2 border-t border-line bg-app/95 px-6 pb-4 pt-3 backdrop-blur">
+          <CopyProgress
+            v-if="store.copying && store.progress"
+            :progress="store.progress"
+            @cancel="cancelCopy"
+          />
+
+          <template v-else>
+            <!-- 完成汇总 -->
+            <div
+              v-if="store.report"
+              class="mb-3 flex items-center gap-4 rounded-card border border-line bg-surface px-4 py-2.5 text-sm shadow-card"
             >
-              <Play class="mr-1.5 inline size-4 -translate-y-px" />
-              开始拷贝
-            </button>
-          </div>
-        </template>
-      </div>
+              <span class="flex items-center gap-1.5 text-ok">
+                <CircleCheck class="size-4" /> 拷贝完成
+              </span>
+              <span class="text-ink-2">
+                成功 {{ store.report.copied }} 个
+                <template v-if="store.report.failed"> · 失败 {{ store.report.failed }} 个</template>
+                · 用时 {{ store.report.elapsed }} 秒 · 平均 {{ formatBytes(store.report.avgBps) }}/s
+              </span>
+              <button
+                class="ml-auto flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-xs text-ink-2 hover:bg-hover"
+                @click="store.selectedDevice && pickAndScan()"
+              >
+                <RotateCw class="size-3.5" /> 再扫一次核对
+              </button>
+            </div>
+
+            <div v-if="copyingError" class="mb-2 text-xs text-bad">{{ copyingError }}</div>
+
+            <div class="flex items-center gap-4">
+              <span class="text-sm text-ink-2">
+                待拷
+                <b class="text-ink">{{ store.plan.newFiles }}</b> 个文件 ·
+                {{ formatBytes(store.plan.newBytes) }}
+                <template v-if="store.plan.existsFiles">
+                  · 跳过已存在 {{ store.plan.existsFiles }} 个
+                </template>
+                <template v-if="store.plan.suspectFiles">
+                  · <span class="text-warn">改名跳过 {{ store.plan.suspectFiles }} 个</span>
+                </template>
+                <template v-if="store.plan.conflictFiles">
+                  · <span class="text-bad">冲突 {{ store.plan.conflictFiles }} 个</span>
+                </template>
+              </span>
+              <span v-if="deficit" class="text-xs text-bad">
+                目标盘剩余 {{ formatBytes(store.plan.freeBytes) }}，还差 {{ formatBytes(deficit) }}
+              </span>
+              <button
+                class="ml-auto h-10 rounded-xl bg-amber px-6 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
+                :disabled="!store.plan.spaceOk || store.plan.newFiles === 0"
+                @click="startCopy"
+              >
+                <Play class="mr-1.5 inline size-4 -translate-y-px" />
+                开始拷贝
+              </button>
+            </div>
+          </template>
+        </div>
+      </template>
     </template>
   </div>
 </template>

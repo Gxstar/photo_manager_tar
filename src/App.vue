@@ -1,23 +1,61 @@
 <script setup>
-import { computed, onMounted } from "vue";
-import { HardDrive, Settings as SettingsIcon, FolderOpen } from "lucide-vue-next";
-import { store, loadConfig, loadStats, refreshDevices, watchLibraryStats, formatBytes } from "./store.js";
+import { computed, onMounted, watch } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import { HardDrive, Settings as SettingsIcon, FolderOpen, Images } from "lucide-vue-next";
+import {
+  store,
+  loadConfig,
+  loadStats,
+  refreshDevices,
+  watchLibraryStats,
+  hasCard,
+  formatBytes,
+} from "./store.js";
 import CopyOrganize from "./pages/CopyOrganize.vue";
+import Gallery from "./pages/Gallery.vue";
 import Settings from "./pages/Settings.vue";
 
 const pages = [
   { id: "copy", title: "拷贝整理", icon: HardDrive, component: CopyOrganize },
+  { id: "gallery", title: "图库", icon: Images, component: Gallery },
   { id: "settings", title: "设置", icon: SettingsIcon, component: Settings },
 ];
 
 const current = computed(() => pages.find((p) => p.id === store.page) ?? pages[0]);
 
+/**
+ * 启动落点：插着有内容的卡 → 直奔导入页（配合插卡自动扫描，插卡后零点击）；
+ * 否则恢复上次停留页，首次启动落在拷贝整理
+ */
+function pickStartPage() {
+  if (hasCard()) return "copy";
+  const last = store.config?.lastPage;
+  return pages.some((p) => p.id === last) ? last : "copy";
+}
+
 onMounted(async () => {
   watchLibraryStats();
+  // 必须先拿到设备列表再决策，否则会把「有卡」误判成「无卡」，页面闪一下再跳走
   await loadConfig();
-  await loadStats();
-  refreshDevices();
+  await refreshDevices();
+  store.page = pickStartPage();
+  loadStats(); // 全库统计较慢，不阻塞首屏（侧边栏数据异步补齐）
 });
+
+// 记录上次停留页，供下次启动恢复。
+// 首次触发是启动落点（程序决定，不算用户选择），跳过以免把「有卡强制导入」写回配置
+let pageDecided = false;
+watch(
+  () => store.page,
+  (p) => {
+    if (!p) return;
+    if (!pageDecided) {
+      pageDecided = true;
+      return;
+    }
+    invoke("set_last_page", { page: p }).catch(() => {});
+  }
+);
 </script>
 
 <template>
@@ -29,8 +67,8 @@ onMounted(async () => {
           <FolderOpen class="size-4.5" />
         </span>
         <div class="leading-tight">
-          <div class="text-[15px] font-semibold">SD 卡拷贝整理</div>
-          <div class="text-[11px] text-ink-3">sdcard-importer</div>
+          <div class="text-[15px] font-semibold">显影</div>
+          <div class="text-[11px] text-ink-3">develop</div>
         </div>
       </div>
 
@@ -79,7 +117,7 @@ onMounted(async () => {
       </header>
       <div class="min-h-0 flex-1 overflow-y-auto">
         <Transition name="fade" mode="out-in">
-          <component :is="current.component" />
+          <component :is="current.component" v-if="store.page" />
         </Transition>
       </div>
     </main>
