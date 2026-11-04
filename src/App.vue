@@ -23,6 +23,15 @@ const pages = [
 
 const current = computed(() => pages.find((p) => p.id === store.page) ?? pages[0]);
 
+// 侧边栏只有 ~160px 可用宽度，整条路径塞进去会把「媒体库」挤成一列竖排字。
+// 只显示末段目录名，完整路径进 tooltip。
+const rootLabel = computed(() => {
+  const root = (store.config?.libraryRoot ?? "").replace(/[\\/]+$/, "");
+  if (!root) return "未设置";
+  const seg = root.split(/[\\/]/).filter(Boolean).pop();
+  return seg ?? root;
+});
+
 /**
  * 启动落点：插着有内容的卡 → 直奔导入页（配合插卡自动扫描，插卡后零点击）；
  * 否则恢复上次停留页，首次启动落在拷贝整理
@@ -98,14 +107,14 @@ watch(
           v-if="store.stats"
           class="rounded-xl bg-subtle px-3.5 py-3 text-xs text-ink-2"
         >
-          <div class="mb-1 flex items-center justify-between">
-            <span>媒体库</span>
-            <span class="text-ink-3">{{ store.config?.libraryRoot }}</span>
+          <div class="mb-1.5 flex items-center justify-between gap-2">
+            <span class="shrink-0">媒体库</span>
+            <span class="min-w-0 truncate text-ink-3" :title="store.config?.libraryRoot">
+              {{ rootLabel }}
+            </span>
           </div>
-          <div class="flex items-center justify-between">
-            <span>{{ store.stats.totalFiles.toLocaleString() }} 个文件 · {{ formatBytes(store.stats.totalBytes) }}</span>
-            <span class="text-ink-3">剩 {{ formatBytes(store.stats.freeBytes) }}</span>
-          </div>
+          <div class="truncate">{{ store.stats.totalFiles.toLocaleString() }} 个文件 · {{ formatBytes(store.stats.totalBytes) }}</div>
+          <div class="mt-0.5 text-ink-3">剩余 {{ formatBytes(store.stats.freeBytes) }}</div>
         </div>
       </div>
     </aside>

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from "vue";
-import { open } from "@tauri-apps/plugin-dialog";
+// window.confirm 在该 WebView 返回 Promise（恒真），必须用原生对话框插件
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen, HardDrive, FileStack, Save, TriangleAlert } from "lucide-vue-next";
 import {
@@ -22,7 +23,13 @@ const clearing = ref(false);
 const clearedMsg = ref(null);
 
 async function clearLog() {
-  if (!confirm("清空全部导入记录？（只删记录，不影响照片与视频文件）")) return;
+  const ok = await ask("清空全部导入记录？（只删记录，不影响照片与视频文件）", {
+    title: "清空导入记录",
+    kind: "warning",
+    okLabel: "清空",
+    cancelLabel: "取消",
+  });
+  if (!ok) return;
   clearing.value = true;
   behaviorError.value = null;
   clearedMsg.value = null;

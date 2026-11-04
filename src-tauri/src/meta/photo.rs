@@ -201,10 +201,17 @@ fn rw2_sensor_dims(file: &mut File) -> Option<(u32, u32)> {
 }
 
 fn fields_from(exif: &exif::Exif) -> PhotoExif {
-    let text = |tag: Tag| -> Option<String> {
+    // ASCII 字段（Make/Model/镜头等）不能用 display_value：kamadak-exif 对
+    // Ascii 值按 debug 风格输出，会带上一层引号 → 界面上出现 "Canon" "Canon EOS R50"。
+    // 这里直接取原始字节转字符串。
+    let ascii = |tag: Tag| -> Option<String> {
         exif.get_field(tag, In::PRIMARY)
-            .map(|f| f.display_value().with_unit(exif).to_string())
-            .map(|s| s.trim_matches('\0').trim().to_string())
+            .and_then(|f| match &f.value {
+                exif::Value::Ascii(vs) => vs
+                    .first()
+                    .map(|v| String::from_utf8_lossy(v).trim_matches('\0').trim().to_string()),
+                _ => None,
+            })
             .filter(|s| !s.is_empty())
     };
     // 像素尺寸：0xA002/0xA003（ExifImageWidth/Height）在 EXIF sub-IFD，Context 必须用 Exif；
@@ -222,8 +229,8 @@ fn fields_from(exif: &exif::Exif) -> PhotoExif {
     };
     PhotoExif {
         time: exif_datetime(exif).map(|(t, _)| t),
-        make: text(Tag::Make),
-        model: text(Tag::Model),
+        make: ascii(Tag::Make),
+        model: ascii(Tag::Model),
         width,
         height,
     }

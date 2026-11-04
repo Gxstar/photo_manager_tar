@@ -2,6 +2,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import { invoke } from "@tauri-apps/api/core";
+// 注意：这个 WebView 里 window.confirm 返回的是 Promise（不是布尔），
+// `!confirm(...)` 恒为 false，二次确认会静默失效 → 统一用原生对话框插件
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
   Aperture,
   Film,
@@ -79,6 +82,19 @@ const displayItems = computed(() => {
     const r = it.rating ?? 0;
     return rating === "picked" ? r >= 3 : r === 0;
   });
+});
+
+// 评分筛选出空结果时给出真实原因：三种空法（类型里没有可评分文件 /
+// 还没人打高分 / 全都打过）用户看到的都是空网格，文案必须区分，
+// 否则「≥3★ 为空」会被误读成「评分功能坏了」
+const emptyHint = computed(() => {
+  if (ratingFilter.value === "all") return null;
+  const kind = kindFilter.value;
+  const pool =
+    kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
+  if (!pool.some(isRatable)) return "评分筛选只对 JPG 生效，当前类型下没有可评分的文件";
+  if (ratingFilter.value === "picked") return "还没有 ≥3★ 的照片，选中后按 0-5 即可打分";
+  return "可评分的照片都已经打过分了";
 });
 
 // 切换筛选时清掉旧选择与键盘游标（跨筛选的选择集没有意义）
@@ -576,7 +592,15 @@ async function onRate(i) {
   // 单选：再点当前星 = 清除；多选：直接设为该值
   const value = targets.length === 1 && curRating.value === i ? null : i;
   // 大批量（Ctrl+A 后误操作）二次确认：每张都要整体重写文件，代价不低
-  if (targets.length > 50 && !confirm(`将给 ${targets.length} 张照片写入评分，继续？`)) return;
+  if (targets.length > 50) {
+    const ok = await ask(`将给 ${targets.length} 张照片写入评分，继续？`, {
+      title: "批量评分",
+      kind: "warning",
+      okLabel: "继续",
+      cancelLabel: "取消",
+    });
+    if (!ok) return;
+  }
   ratingBusy.value = true;
   ratingError.value = null;
   try {
@@ -719,9 +743,7 @@ function relDir(item) {
       <div v-else-if="!store.gallery.loading && !displayItems.length" class="grid flex-1 place-items-center">
         <div class="text-center">
           <p class="text-sm text-ink-3">当前筛选下没有文件</p>
-          <p v-if="ratingFilter !== 'all'" class="mt-1.5 text-xs text-ink-3">
-            评分筛选只对可评分的 JPG 生效
-          </p>
+          <p v-if="emptyHint" class="mt-1.5 text-xs text-ink-3">{{ emptyHint }}</p>
         </div>
       </div>
 
