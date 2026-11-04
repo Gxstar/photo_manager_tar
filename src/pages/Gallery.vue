@@ -654,6 +654,44 @@ function cameraLabel(infoData) {
   return model ?? make ?? null;
 }
 
+// ── 曝光参数格式化（后端给裸数值，展示约定放前端） ──────────────────────
+const fmtNum = (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+
+function fmtShutter(ex) {
+  if (!ex?.num || !ex?.den) return null;
+  const secs = ex.num / ex.den;
+  if (secs >= 1) return `${Number(secs.toFixed(1))}s`;
+  const inv = ex.den / ex.num;
+  // 1/1600 这类倒数值应接近整数；4/10 这种写法则退回小数（0.4s）
+  return Math.abs(inv - Math.round(inv)) < 0.02
+    ? `1/${Math.round(inv)}`
+    : `${secs.toFixed(1)}s`;
+}
+
+function fmtFocal(mm) {
+  return `${fmtNum(Number(mm.toFixed(1)))}mm`;
+}
+
+const exposureRows = computed(() => {
+  const d = info.value;
+  if (!d) return [];
+  const rows = [];
+  if (d.fNumber) rows.push({ label: "光圈", value: `f/${fmtNum(Number(d.fNumber.toFixed(1)))}` });
+  const shutter = fmtShutter(d.exposure);
+  if (shutter) rows.push({ label: "快门", value: shutter });
+  if (d.iso) rows.push({ label: "ISO", value: String(d.iso) });
+  if (d.focalLength) {
+    // 等效焦距单独一行小字：挤在同一行会把「43mm（86mm 等效）」折成两截
+    const eq = d.focalLength35mm ? Math.round(d.focalLength35mm) : 0;
+    rows.push({
+      label: "焦距",
+      value: fmtFocal(d.focalLength),
+      sub: eq && eq !== Math.round(d.focalLength) ? `等效 ${eq}mm` : null,
+    });
+  }
+  return rows;
+});
+
 function relDir(item) {
   const root = store.config?.libraryRoot ?? "";
   const p = item.path.replaceAll("/", "\\");
@@ -886,6 +924,20 @@ function relDir(item) {
           <div>
             <dt class="mb-0.5 text-xs text-ink-3">相机</dt>
             <dd class="text-ink">{{ cameraLabel(info) ?? "—" }}</dd>
+          </div>
+          <div v-if="info?.lens">
+            <dt class="mb-0.5 text-xs text-ink-3">镜头</dt>
+            <dd class="break-words text-ink">{{ info.lens }}</dd>
+          </div>
+          <!-- 曝光四件套：两列排布，缺项自动不占位（视频/无 EXIF 时不显示整块） -->
+          <div v-if="exposureRows.length" class="grid grid-cols-2 gap-x-3 gap-y-2.5">
+            <div v-for="row in exposureRows" :key="row.label">
+              <dt class="mb-0.5 text-xs text-ink-3">{{ row.label }}</dt>
+              <dd class="text-ink">
+                {{ row.value }}
+                <span v-if="row.sub" class="block text-[11px] leading-4 text-ink-3">{{ row.sub }}</span>
+              </dd>
+            </div>
           </div>
           <div>
             <dt class="mb-0.5 text-xs text-ink-3">分辨率</dt>

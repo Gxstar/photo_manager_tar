@@ -117,11 +117,12 @@ async function saveRoot(dir) {
     >
       <div class="rounded-card border border-line bg-surface p-4 shadow-card">
         <div class="flex items-center gap-2 text-xs text-ink-2">
-          <FileStack class="size-4 text-ink-3" /> 文件总数
+          <FileStack class="size-4 text-ink-3" /> 媒体文件
         </div>
         <div class="mt-1.5 text-xl font-semibold tabular-nums">
           {{ store.stats.totalFiles.toLocaleString() }}
         </div>
+        <div class="mt-0.5 text-[11px] text-ink-3">原图 + 视频，与图库项数一致</div>
       </div>
       <div class="rounded-card border border-line bg-surface p-4 shadow-card">
         <div class="flex items-center gap-2 text-xs text-ink-2">

@@ -433,6 +433,29 @@ fn gallery_time_and_info_match_fixtures() {
     assert!(info.model.is_some(), "RW2 应解析出机型");
     assert!(info.width.unwrap_or(0) >= 1000 && info.height.unwrap_or(0) >= 700, "RW2 传感器尺寸应合理，实际 {:?}", (info.width, info.height));
 
+    // 信息栏曝光四件套 + 镜头（夹具已知值，强断言防回归）
+    assert_eq!(
+        info.lens.as_deref(),
+        Some("SL 55mm F1.8 STM PRO"),
+        "LensModel 必须 trim 掉尾部空格，实际 {:?}",
+        info.lens
+    );
+    assert_eq!(info.iso, Some(1600));
+    let ex = info.exposure.as_ref().expect("ExposureTime 应解析");
+    // 相机可能写 10/600 这种未约分值，只要秒数正确即可（前端负责显示成 1/60）
+    let secs = ex.num as f64 / ex.den as f64;
+    assert!(
+        (secs - 1.0 / 60.0).abs() < 1e-9,
+        "夹具曝光应为 1/60 秒，实际 {}/{} = {secs}",
+        ex.num,
+        ex.den
+    );
+    let f = info.f_number.expect("FNumber 应解析");
+    assert!((f - 1.8).abs() < 0.01, "光圈应为 f/1.8，实际 {f}");
+    let mm = info.focal_length.expect("FocalLength 应解析");
+    assert!((mm - 55.0).abs() < 0.01, "焦距应为 55mm，实际 {mm}");
+    assert_eq!(info.focal_length_35mm, Some(55));
+
     let info = crate::gallery::info(&fix_mp4.to_string_lossy(), FileKind::Video);
     assert_eq!(info.shoot_time.as_deref(), Some("2026-10-07 14:57:08"));
     let (w, h) = (info.width.unwrap_or(0), info.height.unwrap_or(0));
@@ -486,6 +509,69 @@ fn gallery_full_library_smoke() {
         per_file_ms * items.len() as f64 / 1000.0
     );
     assert!(ok >= 25, "抽样成功率过低：{ok}/30");
+}
+
+/// G-06：评分写入不得改动文件系统的修改时间（mtime）。
+/// 缩略图缓存以 mtime 为 key，mtime 一变整个缓存失效重做；用户看到的
+/// 「修改时间」也会跳到打分时刻。EXIF 拍摄时间本来就不受影响。
+#[test]
+fn rating_write_keeps_mtime() {
+    let dir = std::env::temp_dir().join(format!("sdi-mtime-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let jpg = synth_jpeg(&dir, "rate.jpg", 64, 32);
+
+    // 隔开一点，让「被改成当前时间」这种情况能被断言捕捉到
+    std::thread::sleep(Duration::from_millis(1100));
+    let before = std::fs::metadata(&jpg).unwrap().modified().unwrap();
+
+    crate::meta::xmp::write_jpeg_rating(&jpg, 4).expect("写入评分应成功");
+    assert_eq!(crate::meta::xmp::jpeg_rating(&jpg), Some(4));
+    let after = std::fs::metadata(&jpg).unwrap().modified().unwrap();
+    assert_eq!(after, before, "打分后 mtime 必须与写入前一致");
+
+    // 清除评分同样要保 mtime
+    crate::meta::xmp::write_jpeg_rating(&jpg, 0).expect("清除评分应成功");
+    assert_eq!(crate::meta::xmp::jpeg_rating(&jpg), None);
+    let cleared = std::fs::metadata(&jpg).unwrap().modified().unwrap();
+    assert_eq!(cleared, before, "清除评分后 mtime 必须保持不变");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// G-07：侧边栏统计口径必须等于图库项数（原图 + 视频里的 image/raw/video）。
+/// 成片、sidecar、desktop.ini 都不计入——否则侧边栏和图库两个数字对不上。
+#[test]
+fn library_stats_matches_gallery_count() {
+    let lib = std::env::temp_dir().join(format!("sdi-stats-{}", std::process::id()));
+    let orig = lib.join("原图").join("2026").join("2026-10");
+    let vid = lib.join("视频").join("2026").join("2026-10");
+    let out = lib.join("成片").join("2026").join("2026-10");
+    for d in [&orig, &vid, &out] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    synth_jpeg(&orig, "a.jpg", 32, 32);
+    std::fs::write(orig.join("b.RW2"), b"IIU\0").unwrap();
+    std::fs::write(orig.join("a.xmp"), b"<x/>").unwrap(); // sidecar 不计
+    std::fs::write(orig.join("desktop.ini"), b"").unwrap(); // 系统文件不计
+    std::fs::write(vid.join("c.mp4"), b"x").unwrap();
+    synth_jpeg(&out, "d.jpg", 32, 32); // 成片不在图库范围，不计
+
+    let cfg = crate::models::AppConfig {
+        library_root: lib.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let stats = crate::commands::library_stats_for(&cfg).expect("统计应成功");
+    let items = crate::gallery::list_items(&cfg).expect("列表应成功");
+
+    assert_eq!(items.len(), 3, "图库应收 a.jpg / b.RW2 / c.mp4");
+    assert_eq!(stats.total_files, items.len(), "侧边栏数字必须等于图库项数");
+    assert_eq!(
+        stats.total_bytes,
+        items.iter().map(|i| i.size).sum::<u64>(),
+        "占用字节也必须同口径"
+    );
+
+    let _ = std::fs::remove_dir_all(&lib);
 }
 
 fn format_bytes(n: u64) -> String {

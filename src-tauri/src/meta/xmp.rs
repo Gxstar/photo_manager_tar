@@ -43,6 +43,12 @@ pub fn jpeg_rating_from_head(head: &[u8]) -> Option<u8> {
 
 /// 写入 xmp:Rating（0 = 清除评分）。返回写入后的错误信息（成功为空）。
 pub fn write_jpeg_rating(path: &Path, rating: u8) -> Result<(), String> {
+    // 记录原 mtime，写入后还原：评分只改 XMP 元数据，画面内容不变。
+    // 不还原的后果：文件系统的「修改时间」变成打分时刻（缩略图缓存以 mtime 为
+    // key 会全部失效重做，用户看到的照片时间也凭空变了）。拍摄时间在 EXIF 里
+    // 本来就不受影响。
+    let orig_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+
     let mut data = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
     if data.len() < 4 || &data[0..2] != b"\xFF\xD8" {
         return Err("不是 JPEG 文件".into());
@@ -115,6 +121,12 @@ pub fn write_jpeg_rating(path: &Path, rating: u8) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("替换失败: {e}")
     })?;
+    // 还原 mtime（失败不影响评分本身，只是缓存会重做一遍）
+    if let Some(t) = orig_mtime {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_modified(t);
+        }
+    }
     Ok(())
 }
 

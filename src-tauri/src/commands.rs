@@ -147,7 +147,7 @@ pub fn start_copy(
         }
 
         // 拷贝结束后推送最新库统计
-        if let Ok(stats) = library_stats_for(&config::load().library_root) {
+        if let Ok(stats) = library_stats_for(&config::load()) {
             let _ = app.emit("library-stats", stats);
         }
     });
@@ -185,31 +185,24 @@ pub fn pause_copy(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
 /// 媒体库统计：文件数 / 总占用 / 剩余空间
 #[tauri::command]
 pub fn library_stats(state: State<'_, AppState>) -> AppResult<LibraryStats> {
-    let root = state.config.lock().unwrap().library_root.clone();
-    library_stats_for(&root)
+    let cfg = state.config.lock().unwrap().clone();
+    library_stats_for(&cfg)
 }
 
-fn library_stats_for(root: &str) -> AppResult<LibraryStats> {
-    let lib = Path::new(root);
+/// 口径与图库一致：复用 `gallery::list_items`（原图 + 视频两棵子树，
+/// 按 image/raw/video 分类，忽略 desktop.ini 等）。
+/// 之前是全库 WalkDir 统计所有文件，侧边栏 18,498 与图库 13,177 并列显示，
+/// 看上去像数据坏了——用户要求统一为「图库能显示的总数量」。
+pub(crate) fn library_stats_for(cfg: &AppConfig) -> AppResult<LibraryStats> {
+    let lib = Path::new(&cfg.library_root);
     if !lib.is_dir() {
-        return Err(AppError::LibraryUnreachable(root.to_string()));
+        return Err(AppError::LibraryUnreachable(cfg.library_root.clone()));
     }
-    let mut total_files = 0usize;
-    let mut total_bytes: u64 = 0;
-    for entry in walkdir::WalkDir::new(lib).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name == "desktop.ini" || name == "thumbs.db" {
-                continue;
-            }
-            total_files += 1;
-            if let Ok(m) = entry.metadata() {
-                total_bytes += m.len();
-            }
-        }
-    }
+    let items = gallery::list_items(cfg)?;
+    let total_files = items.len();
+    let total_bytes: u64 = items.iter().map(|it| it.size).sum();
     let free = {
-        let s = root.to_string();
+        let s = cfg.library_root.as_str();
         if s.len() >= 3 && s.as_bytes()[1] == b':' {
             device::free_space_of_drive(&format!("{}\\", &s[..2])).unwrap_or(0)
         } else {

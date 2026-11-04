@@ -59,9 +59,27 @@ pub struct GalleryInfo {
     pub shoot_time: Option<String>,
     pub make: Option<String>,
     pub model: Option<String>,
+    /// 镜头型号
+    pub lens: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub rating: Option<u8>,
+    /// 光圈值 f/N
+    pub f_number: Option<f64>,
+    /// 曝光时间（分子/分母），前端按 num<den 显示 1/N
+    pub exposure: Option<ExposureTime>,
+    pub iso: Option<u32>,
+    /// 实际焦距 mm
+    pub focal_length: Option<f64>,
+    /// 等效 35mm 焦距 mm（缺省时前端不显示）
+    pub focal_length_35mm: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureTime {
+    pub num: u32,
+    pub den: u32,
 }
 
 /// 类型缓存：path → (mtime, shoot_time)，供 gallery_list 命中复用
@@ -268,11 +286,9 @@ pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
             GalleryInfo {
                 shoot_time: video_shoot_time(&p)
                     .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
-                make: None,
-                model: None,
                 width: (w > 0).then_some(w),
                 height: (h > 0).then_some(h),
-                rating: None,
+                ..GalleryInfo::empty()
             }
         }
         FileKind::Image | FileKind::Raw => match photo_exif(&p) {
@@ -280,18 +296,17 @@ pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
                 shoot_time: e.time.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
                 make: e.make,
                 model: e.model,
+                lens: e.lens,
                 width: e.width,
                 height: e.height,
                 rating,
+                f_number: e.f_number,
+                exposure: e.exposure.map(|(num, den)| ExposureTime { num, den }),
+                iso: e.iso,
+                focal_length: e.focal_length,
+                focal_length_35mm: e.focal_length_35mm,
             },
-            None => GalleryInfo {
-                shoot_time: None,
-                make: None,
-                model: None,
-                width: None,
-                height: None,
-                rating,
-            },
+            None => GalleryInfo { rating, ..GalleryInfo::empty() },
         },
         _ => GalleryInfo::empty(),
     }
@@ -303,9 +318,15 @@ impl GalleryInfo {
             shoot_time: None,
             make: None,
             model: None,
+            lens: None,
             width: None,
             height: None,
             rating: None,
+            f_number: None,
+            exposure: None,
+            iso: None,
+            focal_length: None,
+            focal_length_35mm: None,
         }
     }
 }

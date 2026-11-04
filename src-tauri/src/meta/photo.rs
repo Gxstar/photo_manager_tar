@@ -128,8 +128,20 @@ pub struct PhotoExif {
     pub time: Option<NaiveDateTime>,
     pub make: Option<String>,
     pub model: Option<String>,
+    /// 镜头型号（Exif 0xA434 LensModel），如 "RF50mm F1.8 STM"
+    pub lens: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// 光圈值 f/N（0x829D FNumber 有理数）
+    pub f_number: Option<f64>,
+    /// 曝光时间（0x829A ExposureTime 分子/分母，如 (1, 1600)）
+    pub exposure: Option<(u32, u32)>,
+    /// ISO（0x8827 PhotographicSensitivity）
+    pub iso: Option<u32>,
+    /// 实际焦距 mm（0x920A FocalLength）
+    pub focal_length: Option<f64>,
+    /// 等效 35mm 焦距 mm（0xA405，松下等写这条；佳能 JPG 常缺）
+    pub focal_length_35mm: Option<u32>,
 }
 
 /// 照片完整信息，分支同 photo_shoot_time（RW2 内嵌 APP1 / 标准容器）
@@ -223,6 +235,21 @@ fn fields_from(exif: &exif::Exif) -> PhotoExif {
             .map(|v| v as u32)
             .filter(|v| *v > 0)
     };
+    // 有理数取值：kamadak-exif 0.6 没有 get_rational，只能自己 match。
+    // den == 0 或 num == 0 视为无效（部分镜头写 0/0 表示未知）。
+    let rational = |tag: Tag| -> Option<(u32, u32)> {
+        exif.get_field(tag, In::PRIMARY)
+            .and_then(|f| match &f.value {
+                exif::Value::Rational(vs) => vs.first().map(|r| (r.num, r.denom)),
+                _ => None,
+            })
+            .filter(|(n, d)| *n > 0 && *d > 0)
+    };
+    let uint = |tag: Tag| -> Option<u32> {
+        exif.get_field(tag, In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .filter(|v| *v > 0)
+    };
     let (width, height) = match dim(Context::Exif, 0xA002) {
         Some(w) => (Some(w), dim(Context::Exif, 0xA003)),
         None => (dim(Context::Tiff, 0x0002), dim(Context::Tiff, 0x0003)),
@@ -231,7 +258,13 @@ fn fields_from(exif: &exif::Exif) -> PhotoExif {
         time: exif_datetime(exif).map(|(t, _)| t),
         make: ascii(Tag::Make),
         model: ascii(Tag::Model),
+        lens: ascii(Tag::LensModel),
         width,
         height,
+        f_number: rational(Tag::FNumber).map(|(n, d)| n as f64 / d as f64),
+        exposure: rational(Tag::ExposureTime),
+        iso: uint(Tag::PhotographicSensitivity),
+        focal_length: rational(Tag::FocalLength).map(|(n, d)| n as f64 / d as f64),
+        focal_length_35mm: uint(Tag::FocalLengthIn35mmFilm),
     }
 }
