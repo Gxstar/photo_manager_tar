@@ -226,24 +226,28 @@ fn parse_meta(p: &PendingItem) -> TimePatch {
             rating = None;
         }
         FileKind::Image | FileKind::Raw => {
-            let need_time = shoot_time.is_none();
-            let need_rating = xmp::is_ratable(path);
-            if need_time || need_rating {
-                let head = read_head(path);
-                if need_time {
+            // ISO BMFF（AVIF/HEIC）的 EXIF item 与 XMP 都在 mdat 里，且在文件尾部
+            // （实测 AVIF 的 XMP 载荷在 700KB+ 处）→ 读 128KB 头毫无意义，走定点读
+            let bmff = crate::meta::bmff::is_bmff(path);
+            let mut head = if shoot_time.is_none() && !bmff { Some(read_head(path)) } else { None };
+            if shoot_time.is_none() {
+                shoot_time = head
+                    .as_deref()
+                    .and_then(crate::meta::photo::photo_time_from_head)
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                     // 头部解析失败 fallback 全文件（个别 EXIF 链超出头部范围）
-                    shoot_time = crate::meta::photo::photo_time_from_head(&head)
-                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .or_else(|| read_time(path, p.kind));
-                }
-                rating = if need_rating {
-                    xmp::rating_from_head(&head)
-                } else {
-                    None
-                };
-            } else {
-                rating = None;
+                    .or_else(|| read_time(path, p.kind));
             }
+            rating = if xmp::is_ratable(path) {
+                if bmff {
+                    crate::meta::bmff::rating(path)
+                } else {
+                    let h = head.get_or_insert_with(|| read_head(path));
+                    xmp::rating_from_head(h)
+                }
+            } else {
+                None
+            };
         }
         _ => rating = None,
     }
@@ -278,8 +282,8 @@ pub fn read_time(path: &Path, kind: FileKind) -> Option<String> {
 /// 单文件信息（信息栏按需读取，单文件毫秒级）
 pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
     let p = PathBuf::from(path);
-    // 评分：仅 JPEG 支持（与 xmp.rs 范围一致），按需现读保证权威
-    let rating = xmp::is_ratable(&p).then(|| xmp::rating(&p)).flatten();
+    // 评分：按需现读保证权威（BMFF 需要解析 iloc 定点读，不能扫头部）
+    let rating = xmp::is_ratable(&p).then(|| xmp::rating_any(&p)).flatten();
     match kind {
         FileKind::Video => {
             let (w, h) = video_dimensions(&p).unwrap_or((0, 0));

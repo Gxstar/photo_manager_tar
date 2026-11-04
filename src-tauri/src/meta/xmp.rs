@@ -43,9 +43,18 @@ pub fn is_raw(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 是否支持评分（JPEG + TIFF 容器 RAW）
+/// 是否支持评分（JPEG + TIFF 容器 RAW + ISO BMFF 图片）
 pub fn is_ratable(path: &Path) -> bool {
-    is_jpeg(path) || is_raw(path)
+    is_jpeg(path) || is_raw(path) || super::bmff::is_bmff(path)
+}
+
+/// 读评分：按容器分派（BMFF 的 XMP 在文件尾部，头部扫不到）
+pub fn rating_any(path: &Path) -> Option<u8> {
+    if super::bmff::is_bmff(path) {
+        super::bmff::rating(path)
+    } else {
+        rating(path)
+    }
 }
 
 /// 读取 xmp:Rating（1-5）。None = 无评分 / 不支持的格式 / 解析失败。
@@ -206,23 +215,30 @@ fn jpeg_xmp_range(head: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// 定位 xmp:Rating 值的字节区间（相对文件头的绝对偏移），供原地替换
-fn locate_rating_span(head: &[u8]) -> Option<(usize, usize)> {
+/// 定位 xmp:Rating 值的字节区间（相对 XMP 包起点），供原地替换。
+/// TIFF 容器在文件头里用，BMFF 在 mime item 载荷里用——两者共用同一份查找逻辑。
+pub(crate) fn rating_span(pkt: &[u8]) -> Option<(usize, usize)> {
     const ATTR: &[u8] = b"xmp:Rating=\"";
     const EL: &[u8] = b"<xmp:Rating>";
     const EL_CLOSE: &[u8] = b"</xmp:Rating>";
 
-    let (pkt_start, pkt_end) = xmp_packet_range(head)?;
-    let pkt = head.get(pkt_start..pkt_end)?;
     let (vstart, close) = if let Some(p) = find_sub(pkt, ATTR) {
-        (pkt_start + p + ATTR.len(), b"\"" as &[u8])
+        (p + ATTR.len(), b"\"" as &[u8])
     } else if let Some(p) = find_sub(pkt, EL) {
-        (pkt_start + p + EL.len(), EL_CLOSE)
+        (p + EL.len(), EL_CLOSE)
     } else {
         return None;
     };
-    let vend = vstart + find_sub(head.get(vstart..pkt_end)?, close)?;
+    let vend = vstart + find_sub(pkt.get(vstart..)?, close)?;
     (vend > vstart).then_some((vstart, vend))
+}
+
+/// 在文件头里定位 xmp:Rating 值的绝对偏移（TIFF / JPEG 容器）
+fn locate_rating_span(head: &[u8]) -> Option<(usize, usize)> {
+    let (pkt_start, pkt_end) = xmp_packet_range(head)?;
+    let pkt = head.get(pkt_start..pkt_end)?;
+    let (s, e) = rating_span(pkt)?;
+    Some((pkt_start + s, pkt_start + e))
 }
 
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -280,7 +296,7 @@ pub fn write_raw_rating(path: &Path, rating: u8) -> Result<(), String> {
 }
 
 /// 从 XMP 包文本解析 xmp:Rating，兼容属性式与元素式；0 / 负值 / 非法 → None
-fn parse_rating(packet: &[u8]) -> Option<u8> {
+pub(crate) fn parse_rating(packet: &[u8]) -> Option<u8> {
     let s = String::from_utf8_lossy(packet);
     const ATTR: &str = "xmp:Rating=\"";
     const EL_OPEN: &str = "<xmp:Rating>";

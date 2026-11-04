@@ -378,12 +378,16 @@ pub fn gallery_open(path: String) -> AppResult<()> {
 /// - JPEG：XMP 在 APP1 段，长度可能变 → 整文件重写（tmp + rename）
 /// - TIFF 容器 RAW（RW2/DNG/…）：XMP 在 IFD 数据区，值恒为单字符
 ///   → 原地改 1 个字节，文件大小与所有偏移不动
+/// - AVIF/HEIF（ISO BMFF）：XMP 在 mime item 的载荷里（文件尾部），同样单字符
+///   → 原地改 1 个字节
 fn write_rating_for(path: &Path, value: u8) -> Result<(), String> {
-    use crate::meta::xmp;
+    use crate::meta::{bmff, xmp};
     if xmp::is_jpeg(path) {
         xmp::write_jpeg_rating(path, value)
     } else if xmp::is_raw(path) {
         xmp::write_raw_rating(path, value)
+    } else if bmff::is_bmff(path) {
+        bmff::write_rating(path, value)
     } else {
         Err("该文件类型不支持评分".to_string())
     }

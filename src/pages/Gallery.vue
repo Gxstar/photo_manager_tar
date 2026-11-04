@@ -69,11 +69,12 @@ function setMinStars(n) {
 const hoverStars = ref(0);
 const starPreview = computed(() => hoverStars.value || minStars.value);
 
-// 可评分格式：JPEG 与 TIFF 容器 RAW（XMP 都在文件内，后端原地改写）
-// 与后端 xmp::RAW_EXTS 保持一致；视频与其他图片格式不参与评分
+// 可评分格式：JPG / TIFF 容器 RAW / ISO BMFF 图片（AVIF、HEIC），评分都写文件内嵌 XMP
+// 与后端 xmp::is_ratable + bmff::is_bmff 保持一致；视频等不参与评分
 const RATABLE_EXTS = [
   "jpg", "jpeg",
   "rw2", "dng", "cr2", "nef", "arw", "orf", "raf", "pef",
+  "avif", "heic", "heif",
 ];
 const isRatable = (item) => RATABLE_EXTS.includes(item.ext);
 
@@ -106,7 +107,7 @@ const emptyHint = computed(() => {
   const kind = kindFilter.value;
   const pool =
     kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
-  if (!pool.some(isRatable)) return "评分筛选只对 JPG / RAW 生效，当前类型下没有可评分的文件";
+  if (!pool.some(isRatable)) return "评分筛选只对 JPG / RAW / AVIF 生效，当前类型下没有可评分的文件";
   if (ratingFilter.value === "unrated") return "可评分的照片都已经打过分了";
   return `还没有 ≥${minStars.value}★ 的照片，选中后按 0-5 即可打分`;
 });
@@ -573,7 +574,7 @@ const hoverRating = ref(0);
 const ratingBusy = ref(false);
 const ratingError = ref(null);
 
-const isJpeg = isRatable; // 语义别名：当前可评分 = JPG / RAW
+const isJpeg = isRatable; // 语义别名：当前可评分 = JPG / RAW / AVIF / HEIC
 
 // path → item（多选打分时避免 N×N 查找；Ctrl+A 全选后这是刚性需求）
 const itemByPath = computed(() => {
@@ -758,7 +759,7 @@ function relDir(item) {
           <!-- 评分筛选：只筛可评分文件，避免不可打分的视频淹没「未评」 -->
           <div
             class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
-            :title="minStars ? `显示 ≥${minStars}★ 的可评分文件（再点同一颗星取消）` : '按星级筛选（只对可评分的 JPG / RAW 生效）'"
+            :title="minStars ? `显示 ≥${minStars}★ 的可评分文件（再点同一颗星取消）` : '按星级筛选（只对可评分的 JPG / RAW / AVIF 生效）'"
             @mouseleave="hoverStars = 0"
           >
             <button
