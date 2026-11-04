@@ -118,9 +118,9 @@ impl MetaStore {
                  shoot_time = excluded.shoot_time, rating = excluded.rating",
         ) {
             for p in patches {
-                let is_jpeg = crate::meta::xmp::is_jpeg(Path::new(&p.path));
-                // JPEG：0 = 已确认无评分（区别于 NULL = 非 JPEG 不适用）
-                let rating = if is_jpeg { Some(i64::from(p.rating.unwrap_or(0))) } else { None };
+                let ratable = crate::meta::xmp::is_ratable(Path::new(&p.path));
+                // 可评分文件：0 = 已确认无评分（区别于 NULL = 类型不支持）
+                let rating = if ratable { Some(i64::from(p.rating.unwrap_or(0))) } else { None };
                 let _ = stmt.execute(rusqlite::params![p.path, p.mtime_secs, p.shoot_time, rating]);
             }
         }
@@ -301,6 +301,12 @@ mod tests {
                 shoot_time: Some("2026-02-02 11:00:00".into()),
                 rating: None,
             },
+            TimePatch {
+                path: "c.mp4".into(),
+                mtime_secs: 400,
+                shoot_time: Some("2026-03-03 12:00:00".into()),
+                rating: None,
+            },
         ]);
         store.upsert_patches(&[TimePatch {
             path: "a.jpg".into(),
@@ -315,8 +321,10 @@ mod tests {
         assert_eq!(times.get("b.RW2"), Some(&(200, Some("2026-02-02 11:00:00".into()))));
         // 清除后 = 已探测无评分（0 → None）
         assert_eq!(ratings.get("a.jpg"), Some(&(300, None)));
-        // RW2 不写入 rating（NULL），不进评分缓存
-        assert!(!ratings.contains_key("b.RW2"));
+        // RW2 现在也可评分：None → 0（已探测无评分），进入评分缓存
+        assert_eq!(ratings.get("b.RW2"), Some(&(200, None)));
+        // 视频等不可评分类型写 NULL，不进评分缓存
+        assert!(!ratings.contains_key("c.mp4"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

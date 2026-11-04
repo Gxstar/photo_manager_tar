@@ -227,7 +227,7 @@ fn parse_meta(p: &PendingItem) -> TimePatch {
         }
         FileKind::Image | FileKind::Raw => {
             let need_time = shoot_time.is_none();
-            let need_rating = xmp::is_jpeg(path);
+            let need_rating = xmp::is_ratable(path);
             if need_time || need_rating {
                 let head = read_head(path);
                 if need_time {
@@ -237,7 +237,7 @@ fn parse_meta(p: &PendingItem) -> TimePatch {
                         .or_else(|| read_time(path, p.kind));
                 }
                 rating = if need_rating {
-                    xmp::jpeg_rating_from_head(&head)
+                    xmp::rating_from_head(&head)
                 } else {
                     None
                 };
@@ -279,7 +279,7 @@ pub fn read_time(path: &Path, kind: FileKind) -> Option<String> {
 pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
     let p = PathBuf::from(path);
     // 评分：仅 JPEG 支持（与 xmp.rs 范围一致），按需现读保证权威
-    let rating = xmp::is_jpeg(&p).then(|| xmp::jpeg_rating(&p)).flatten();
+    let rating = xmp::is_ratable(&p).then(|| xmp::rating(&p)).flatten();
     match kind {
         FileKind::Video => {
             let (w, h) = video_dimensions(&p).unwrap_or((0, 0));

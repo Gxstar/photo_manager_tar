@@ -51,7 +51,7 @@ const filterOpts = [
 ];
 
 // ── 评分筛选 ─────────────────────────────────────────────────────────────
-// 只对「可评分文件」生效（当前仅 JPEG）：选「未评」时不把无法评分的 RAW/视频
+// 只对「可评分文件」生效（JPEG + TIFF 容器 RAW）：选「未评」时不把视频等不可评分的项
 // 混进来，否则几千个不可打分文件会把空档淹没。将来 RAW 支持 sidecar 评分，
 // 改 isRatable 一处即可。
 const ratingFilter = ref("all"); // all | picked | unrated
@@ -62,7 +62,13 @@ const ratingOpts = [
   { value: "unrated", label: "未评" },
 ];
 
-const isRatable = (item) => ["jpg", "jpeg"].includes(item.ext);
+// 可评分格式：JPEG 与 TIFF 容器 RAW（XMP 都在文件内，后端原地改写）
+// 与后端 xmp::RAW_EXTS 保持一致；视频与其他图片格式不参与评分
+const RATABLE_EXTS = [
+  "jpg", "jpeg",
+  "rw2", "dng", "cr2", "nef", "arw", "orf", "raf", "pef",
+];
+const isRatable = (item) => RATABLE_EXTS.includes(item.ext);
 
 const kindCounts = computed(() => {
   // 不含 all：总数已在工具条左侧「N 项」，「全部」按钮不重复展示
@@ -92,7 +98,7 @@ const emptyHint = computed(() => {
   const kind = kindFilter.value;
   const pool =
     kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
-  if (!pool.some(isRatable)) return "评分筛选只对 JPG 生效，当前类型下没有可评分的文件";
+  if (!pool.some(isRatable)) return "评分筛选只对 JPG / RAW 生效，当前类型下没有可评分的文件";
   if (ratingFilter.value === "picked") return "还没有 ≥3★ 的照片，选中后按 0-5 即可打分";
   return "可评分的照片都已经打过分了";
 });
@@ -553,12 +559,12 @@ watch(singleItem, async (item) => {
   }
 });
 
-// ── 评分（XMP xmp:Rating，仅 JPEG）───────────────────────────────────────
+// ── 评分（XMP xmp:Rating，JPEG 与 RAW 均写文件内嵌 XMP）──────────────────
 const hoverRating = ref(0);
 const ratingBusy = ref(false);
 const ratingError = ref(null);
 
-const isJpeg = isRatable; // 语义别名：当前可评分 = JPEG
+const isJpeg = isRatable; // 语义别名：当前可评分 = JPG / RAW
 
 // path → item（多选打分时避免 N×N 查找；Ctrl+A 全选后这是刚性需求）
 const itemByPath = computed(() => {
@@ -743,7 +749,7 @@ function relDir(item) {
           <!-- 评分筛选：只筛可评分文件，避免不可打分的 RAW/视频淹没「未评」 -->
           <div
             class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
-            title="按星级筛选（只对可评分的 JPG 生效）"
+            title="按星级筛选（只对可评分的 JPG / RAW 生效）"
           >
             <Star class="mx-1 size-3 shrink-0 text-ink-3" />
             <button
@@ -892,7 +898,7 @@ function relDir(item) {
           <LoaderCircle class="size-5 animate-spin" />
         </div>
         <dl v-else class="flex flex-col gap-3 px-5 py-4 text-sm">
-          <!-- 评分（仅 JPEG 可写） -->
+          <!-- 评分（JPEG 与 RAW 可写，RAW 写文件内嵌 XMP） -->
           <div v-if="isJpeg(singleItem)">
             <dt class="mb-1 text-xs text-ink-3">评分</dt>
             <dd class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
@@ -985,11 +991,11 @@ function relDir(item) {
           <!-- 批量评分（选中项含 JPEG 时可用） -->
           <div v-if="selected.size > 1 && rateTargets.length" class="mt-4">
             <div class="mb-1.5 text-xs text-ink-3">
-              批量评分（{{ rateTargets.length }} 张 JPG）
+              批量评分（{{ rateTargets.length }} 张）
             </div>
             <!-- 不静默跳过：让用户知道哪些选中项不会被打分 -->
             <p v-if="selected.size > rateTargets.length" class="mb-1.5 text-[11px] text-ink-3">
-              另有 {{ selected.size - rateTargets.length }} 个 RAW / 视频不支持评分
+              另有 {{ selected.size - rateTargets.length }} 个视频等文件不支持评分
             </p>
             <div
               class="flex items-center justify-center gap-0.5"
@@ -1015,7 +1021,7 @@ function relDir(item) {
             <p v-else-if="ratingBusy" class="mt-2 text-xs text-ink-3">正在写入…</p>
           </div>
           <p v-else-if="selected.size > 1" class="mt-4 text-[11px] leading-5 text-ink-3">
-            选中项没有可评分的 JPG<br />（RAW / 视频暂不支持评分）
+            选中项没有可评分的文件<br />（只有 JPG 与 RAW 支持评分）
           </p>
         </div>
       </div>

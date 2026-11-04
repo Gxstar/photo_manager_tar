@@ -313,7 +313,7 @@ pub async fn gallery_list(
                 }
                 _ => false,
             };
-            let need_rating = crate::meta::xmp::is_jpeg(Path::new(&it.path));
+            let need_rating = crate::meta::xmp::is_ratable(Path::new(&it.path));
             if !time_known || (need_rating && !rating_known) {
                 pending.push(gallery::PendingItem {
                     path: it.path.clone(),
@@ -340,7 +340,7 @@ pub async fn gallery_list(
             {
                 let mut cache = st.rating_cache.lock().unwrap();
                 for p in &patches {
-                    if crate::meta::xmp::is_jpeg(Path::new(&p.path)) {
+                    if crate::meta::xmp::is_ratable(Path::new(&p.path)) {
                         cache.insert(p.path.clone(), (p.mtime_secs, p.rating));
                     }
                 }
@@ -374,7 +374,22 @@ pub fn gallery_open(path: String) -> AppResult<()> {
         .map_err(|e| AppError::IoError(e.to_string()))
 }
 
-/// 批量写入 XMP 评分（JPEG 内嵌；rating=None 表示清除）。
+/// 按容器类型分派写入：
+/// - JPEG：XMP 在 APP1 段，长度可能变 → 整文件重写（tmp + rename）
+/// - TIFF 容器 RAW（RW2/DNG/…）：XMP 在 IFD 数据区，值恒为单字符
+///   → 原地改 1 个字节，文件大小与所有偏移不动
+fn write_rating_for(path: &Path, value: u8) -> Result<(), String> {
+    use crate::meta::xmp;
+    if xmp::is_jpeg(path) {
+        xmp::write_jpeg_rating(path, value)
+    } else if xmp::is_raw(path) {
+        xmp::write_raw_rating(path, value)
+    } else {
+        Err("该文件类型不支持评分".to_string())
+    }
+}
+
+/// 批量写入 XMP 评分（JPEG 与 RAW 均写文件内嵌 XMP；rating=None 表示清除）。
 /// 返回写入失败的「文件名: 原因」列表（空 = 全部成功）。
 #[tauri::command]
 pub async fn gallery_set_rating(
@@ -391,7 +406,7 @@ pub async fn gallery_set_rating(
             .into_iter()
             .map(|p| {
                 let path = Path::new(&p);
-                let r = crate::meta::xmp::write_jpeg_rating(path, value).and_then(|_| {
+                let r = write_rating_for(path, value).and_then(|_| {
                     std::fs::metadata(path)
                         .map(|m| gallery::mtime_of(&m))
                         .map_err(|e| e.to_string())
