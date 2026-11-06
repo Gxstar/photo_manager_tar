@@ -189,6 +189,13 @@ const favoriteCount = computed(
   () => store.gallery.items.filter((it) => it.favorite).length,
 );
 
+/** 一键回到「全部」：筛选组合出空结果时，用户需要一条明确的退路 */
+function clearFilters() {
+  kindFilter.value = "all";
+  ratingFilter.value = "all";
+  favoriteFilter.value = false;
+}
+
 const kindCounts = computed(() => {
   // 不含 all：总数已在工具条左侧「N 项」，「全部」按钮不重复展示
   const c = { image: 0, raw: 0, video: 0 };
@@ -989,7 +996,7 @@ function relDir(item) {
           / 共 {{ store.gallery.items.length.toLocaleString() }} 项
         </span>
         <span class="shrink-0 text-ink-3">·</span>
-        <span class="shrink-0 whitespace-nowrap text-ink-2">{{ formatBytes(totalSize) }}</span>
+        <span v-if="totalSize" class="shrink-0 whitespace-nowrap text-ink-2">{{ formatBytes(totalSize) }}</span>
         <span v-if="timesProgress" class="flex min-w-0 items-center gap-1.5 truncate text-xs text-ink-2">
           <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
           <span class="truncate">正在读取拍摄时间与评分 {{ timesProgress }}（首次较慢）</span>
@@ -1054,22 +1061,24 @@ function relDir(item) {
 
         <span class="h-4 w-px shrink-0 bg-line"></span>
 
-        <!-- 收藏筛选：与评分筛选紧邻但独立成钮，AND 叠加 -->
-        <button
-          class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs transition-colors"
-          :class="favoriteFilter ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:bg-hover'"
-          :title="favoriteFilter ? '只看收藏（再点取消）' : '只看已收藏的文件'"
-          :aria-pressed="favoriteFilter"
-          @click="favoriteFilter = !favoriteFilter"
-        >
-          <Heart
-            class="size-3.5"
-            :class="favoriteFilter ? 'fill-current' : ''"
-            :style="favoriteFilter ? { color: 'var(--fav-on)' } : undefined"
-          />
-          <span>收藏</span>
-          <span class="text-[10px] text-ink-3">{{ favoriteCount.toLocaleString() }}</span>
-        </button>
+        <!-- 收藏筛选：与类型/评分同样的「底槽 + 白药丸选中」，不再只靠图标变色 -->
+        <div class="flex h-7 items-center rounded-lg bg-subtle p-0.5">
+          <button
+            class="flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2 text-xs transition-colors"
+            :class="favoriteFilter ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+            :title="favoriteFilter ? '只看收藏（再点取消）' : '只看已收藏的文件'"
+            :aria-pressed="favoriteFilter"
+            @click="favoriteFilter = !favoriteFilter"
+          >
+            <Heart
+              class="size-3.5"
+              :class="favoriteFilter ? 'fill-current' : ''"
+              :style="favoriteFilter ? { color: 'var(--fav-on)' } : undefined"
+            />
+            <span>收藏</span>
+            <span class="text-[10px] text-ink-2 tabular-nums">{{ favoriteCount.toLocaleString() }}</span>
+          </button>
+        </div>
 
         <!-- 缩略图尺寸：离散 3 档；菜单 Teleport 到 body + fixed，按按钮 rect 定位 -->
         <div class="relative" data-view-menu>
@@ -1147,8 +1156,14 @@ function relDir(item) {
       </div>
       <div v-else-if="!store.gallery.loading && !displayItems.length" class="grid flex-1 place-items-center">
         <div class="text-center">
-          <p class="text-sm text-ink-3">当前筛选下没有文件</p>
-          <p v-if="emptyHint" class="mt-1.5 text-xs text-ink-3">{{ emptyHint }}</p>
+          <p class="text-sm text-ink-2">当前筛选下没有文件</p>
+          <p v-if="emptyHint" class="mt-1.5 text-xs text-ink-2">{{ emptyHint }}</p>
+          <button
+            class="mt-3 rounded-lg border border-line px-3 py-1.5 text-xs text-ink-2 transition-colors hover:bg-hover"
+            @click="clearFilters"
+          >
+            清除筛选
+          </button>
         </div>
       </div>
 
@@ -1431,6 +1446,14 @@ function relDir(item) {
         </p>
 
         <div class="mt-auto border-t border-line p-4">
+          <!-- 快捷键常驻：选中后信息栏一直有这条，不用先按 Esc 清空选择才能复习键位 -->
+          <p class="mb-2 text-center text-[11px] leading-4 text-ink-3">
+            {{
+              singleItem
+                ? "0-5 打分 · 空格收藏 · Enter 打开 · Esc 取消"
+                : "0-5 批量打分 · 空格收藏 · Esc 取消"
+            }}
+          </p>
           <button
             v-if="singleItem"
             class="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg bg-subtle text-xs text-ink-2 transition-colors hover:bg-hover"
@@ -1439,9 +1462,6 @@ function relDir(item) {
             <FolderOpen class="size-3.5" />
             打开所在文件夹
           </button>
-          <p v-else class="text-center text-[11px] leading-5 text-ink-3">
-            0-5 打分 · 空格收藏 · Esc 取消选择
-          </p>
         </div>
       </template>
     </aside>

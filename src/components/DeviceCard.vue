@@ -1,4 +1,5 @@
 <script setup>
+import { computed } from "vue";
 import { RefreshCw, HardDrive, Camera, CircleAlert } from "lucide-vue-next";
 import { formatBytes } from "../store.js";
 
@@ -8,6 +9,13 @@ const props = defineProps({
   disabled: { type: Boolean, default: false },
 });
 const emit = defineEmits(["select"]);
+
+// 空读卡器的 label 就是盘符（I:），再显示一遍路径（I:\）只是重复
+const showPath = computed(() => {
+  const label = (props.device.label ?? "").trim();
+  const path = props.device.path.replace(/\\+$/, "");
+  return !label || label !== path;
+});
 </script>
 
 <template>
@@ -29,7 +37,7 @@ const emit = defineEmits(["select"]);
         <div class="truncate text-sm font-medium">
           {{ device.label || device.path.replace('\\', '') }}
         </div>
-        <div class="text-xs text-ink-3">{{ device.path }}</div>
+        <div class="text-xs text-ink-3" v-if="showPath">{{ device.path }}</div>
       </div>
     </div>
 
