@@ -16,6 +16,8 @@ import {
   Images,
   LayoutGrid,
   LoaderCircle,
+  PanelRight,
+  PanelRightClose,
   RefreshCw,
   Star,
 } from "lucide-vue-next";
@@ -107,6 +109,38 @@ function onGlobalPointerDown(e) {
 // 窗口尺寸变了，fixed 菜单的坐标会失准，直接收起最简单
 function onWindowResize() {
   viewMenuOpen.value = false;
+}
+
+// ── 信息栏开合 ────────────────────────────────────────────────────────────
+// 1280 宽时「侧栏 240 + 信息栏 288」占掉 528px，网格只剩一半；窄窗下把
+// 信息栏收起是唯一能真正还照片以空间的做法（改列数治不了这个根）。
+// 首次进入按窗口宽度决定，之后记住用户的选择。
+const PANEL_KEY = "develop.gallery.panel";
+function readPanelOpen() {
+  try {
+    const v = localStorage.getItem(PANEL_KEY);
+    if (v === "0") return false;
+    if (v === "1") return true;
+  } catch {
+    // 存不了就按窗口宽度给默认值
+  }
+  return window.innerWidth >= 1200;
+}
+const panelOpen = ref(readPanelOpen());
+
+function togglePanel() {
+  panelOpen.value = !panelOpen.value;
+  try {
+    localStorage.setItem(PANEL_KEY, panelOpen.value ? "1" : "0");
+  } catch {
+    // 记住与否不影响本次使用
+  }
+  // 列宽变了：重算列数 + 虚拟行尺寸，避免滚到一半行错位
+  nextTick(() => {
+    measure();
+    rowVirtualizer.value?.measure();
+    scheduleSticky();
+  });
 }
 
 // ── 类型筛选 ─────────────────────────────────────────────────────────────
@@ -818,6 +852,15 @@ const allSelectedFav = computed(
     rateTargets.value.every((p) => itemByPath.value.get(p)?.favorite),
 );
 
+// 单选看这一张，多选看选区是否全已收藏 —— 同一个按钮两种语义
+const favActive = computed(() =>
+  singleItem.value ? !!singleItem.value.favorite : allSelectedFav.value,
+);
+
+function toggleFavTargets() {
+  onToggleFavorite(singleItem.value ? [singleItem.value.path] : null);
+}
+
 // 单选 toggle；多选：选区全部已收藏 → 全部取消，否则 → 全部收藏。
 // 不逐个 toggle，避免混合选区敲一次空格后状态更乱。
 async function onToggleFavorite(overridePaths = null) {
@@ -928,9 +971,12 @@ function relDir(item) {
 </script>
 
 <template>
-  <div class="grid h-full min-h-0 grid-cols-[minmax(0,1fr)_18rem] grid-rows-[auto_minmax(0,1fr)]">
+  <div
+    class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]"
+    :class="panelOpen ? 'grid-cols-[minmax(0,1fr)_18rem]' : 'grid-cols-[minmax(0,1fr)]'"
+  >
     <!-- 全宽工具条：横跨网格区 + 信息栏，不再受网格区宽度限制 -->
-    <div class="col-span-2 flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line px-6 py-1.5 text-sm">
+    <div class="col-span-full flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line px-6 py-1.5 text-sm">
       <template v-if="store.gallery.items.length">
         <!-- 阈值一旦生效，星星靠颜色表达不够明确，用文字再标一次 -->
         <span
@@ -1063,9 +1109,22 @@ function relDir(item) {
           </div>
         </Teleport>
       </div>
+      <!-- 信息栏开合：窄窗下把 288px 还给网格 -->
+      <button
+        class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs transition-colors"
+        :class="[
+          { 'ml-auto': !store.gallery.items.length },
+          panelOpen ? 'text-ink-2 hover:bg-hover' : 'bg-hover text-ink',
+        ]"
+        :title="panelOpen ? '收起信息栏' : '展开信息栏'"
+        :aria-pressed="panelOpen"
+        @click="togglePanel"
+      >
+        <component :is="panelOpen ? PanelRightClose : PanelRight" class="size-3.5" />
+        信息
+      </button>
       <button
         class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
-        :class="{ 'ml-auto': !store.gallery.items.length }"
         :disabled="store.gallery.loading"
         @click="load"
       >
@@ -1238,24 +1297,38 @@ function relDir(item) {
       </div>
     </div>
 
-    <!-- 右侧信息栏 -->
-    <aside class="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-surface">
-      <template v-if="singleItem">
+    <!-- 右侧信息栏：单选看详情、多选看批量操作，动作卡位置固定不跳 -->
+    <aside
+      v-if="panelOpen"
+      class="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-surface"
+    >
+      <!-- 未选中：只放提示与快捷键，不做任何"假操作" -->
+      <div v-if="!selected.size" class="grid flex-1 place-items-center px-6">
+        <div class="text-center">
+          <p class="text-xs leading-5 text-ink-2">选中一张照片或视频查看信息</p>
+          <p v-if="displayItems.length" class="mt-3 text-[11px] leading-5 text-ink-2">
+            方向键选择 · Shift 扩选 · Enter 打开<br />
+            空格收藏 · 0-5 打分 · Ctrl+A 全选 · Esc 取消
+          </p>
+        </div>
+      </div>
+
+      <template v-else>
         <div class="border-b border-line px-5 pb-4 pt-5">
-          <div class="mb-1.5 text-xs text-ink-3">{{ kindLabel(singleItem) }} · {{ singleItem.ext.toUpperCase() }}</div>
-          <div class="break-all text-sm font-medium leading-5" :title="singleItem.name">{{ singleItem.name }}</div>
+          <div class="mb-1.5 text-xs text-ink-3">
+            {{ singleItem ? `${kindLabel(singleItem)} · ${singleItem.ext.toUpperCase()}` : "批量操作" }}
+          </div>
+          <div class="break-all text-sm font-medium leading-5" :title="singleItem?.name">
+            {{ singleItem ? singleItem.name : `已选 ${selected.size} 项` }}
+          </div>
         </div>
 
-        <div v-if="infoLoading" class="grid flex-1 place-items-center text-ink-3">
-          <LoaderCircle class="size-5 animate-spin" />
-        </div>
-        <dl v-else class="flex flex-col gap-2.5 px-5 py-3 text-sm">
-          <!-- 挑片卡片：评分与收藏同一容器（关联），独立行 + 细分隔线（独立）。
-               dt/dd 横排、紧凑 padding，避免顶部占位过高挤掉元数据 -->
-          <div class="rounded-card border border-line bg-subtle px-3 py-2">
+        <!-- 评分 / 收藏：单选与多选共用同一张卡，永远在顶部同一个位置 -->
+        <div class="px-5 py-3">
+          <div class="rounded-card border border-line bg-subtle px-3 py-2 text-sm">
             <div class="flex items-center justify-between gap-2">
-              <dt class="shrink-0 text-xs text-ink-2">评分</dt>
-              <dd class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
+              <span class="shrink-0 text-xs text-ink-2">评分</span>
+              <div class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
                 <button
                   v-for="i in 5"
                   :key="i"
@@ -1274,145 +1347,103 @@ function relDir(item) {
                     :style="starStyle(i, (hoverRating || curRating) >= i)"
                   />
                 </button>
-                <span class="ml-1 text-xs text-ink-2">
-                  {{ hoverRating || curRating || "未评分" }}
+                <span class="ml-1 text-xs text-ink-2 tabular-nums">
+                  {{ singleItem ? hoverRating || curRating || "未评分" : hoverRating || "—" }}
                 </span>
-              </dd>
+              </div>
             </div>
             <div class="mt-1.5 flex items-center justify-between gap-2 border-t border-line pt-1.5">
-              <dt class="shrink-0 text-xs text-ink-2">收藏</dt>
-              <dd class="flex items-center gap-2">
+              <span class="shrink-0 text-xs text-ink-2">收藏</span>
+              <div class="flex items-center gap-2">
                 <button
                   class="grid size-6 place-items-center rounded-lg border border-line bg-surface transition-colors hover:bg-hover disabled:opacity-50"
                   :disabled="favBusy"
-                  :title="singleItem.favorite ? '取消收藏（空格）' : '收藏（空格）'"
-                  :aria-pressed="singleItem.favorite"
-                  @click="onToggleFavorite([singleItem.path])"
+                  :title="favActive ? '取消收藏（空格）' : '收藏（空格）'"
+                  :aria-pressed="favActive"
+                  @click="toggleFavTargets"
                 >
                   <Heart
                     class="size-3.5 transition-colors"
-                    :class="singleItem.favorite ? 'fill-current' : ''"
-                    :style="{ color: singleItem.favorite ? 'var(--fav-on)' : 'var(--star-off)' }"
-                    :stroke-width="singleItem.favorite ? 0 : 2"
+                    :class="favActive ? 'fill-current' : ''"
+                    :style="{ color: favActive ? 'var(--fav-on)' : 'var(--star-off)' }"
+                    :stroke-width="favActive ? 0 : 2"
                   />
                 </button>
-                <span class="text-xs" :class="singleItem.favorite ? 'text-ink' : 'text-ink-3'">
-                  {{ singleItem.favorite ? "已收藏" : "未收藏" }}
+                <span class="text-xs" :class="favActive ? 'text-ink' : 'text-ink-2'">
+                  {{ favActive ? "已收藏" : "未收藏" }}
                 </span>
-              </dd>
+              </div>
             </div>
             <!-- 两条错误极少同时出现，合并成一行，避免把卡片撑高两行 -->
             <p v-if="favError || ratingError" class="mt-1 text-xs text-bad">{{ favError || ratingError }}</p>
+            <p v-else-if="ratingBusy || favBusy" class="mt-1 text-xs text-ink-2">正在保存…</p>
           </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">拍摄时间</dt>
-            <dd class="text-ink">{{ info?.shootTime ?? "—" }}</dd>
+        </div>
+
+        <!-- 单选：元数据 -->
+        <dl v-if="singleItem" class="flex flex-col gap-2.5 px-5 pb-3 text-sm">
+          <div v-if="infoLoading" class="py-6 text-center text-ink-3">
+            <LoaderCircle class="mx-auto size-5 animate-spin" />
           </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">相机</dt>
-            <dd class="text-ink">{{ cameraLabel(info) ?? "—" }}</dd>
-          </div>
-          <div v-if="info?.lens">
-            <dt class="mb-0.5 text-xs text-ink-2">镜头</dt>
-            <dd class="break-words text-ink">{{ info.lens }}</dd>
-          </div>
-          <!-- 曝光四件套：两列排布，缺项自动不占位（视频/无 EXIF 时不显示整块） -->
-          <div v-if="exposureRows.length" class="grid grid-cols-2 gap-x-3 gap-y-2.5">
-            <div v-for="row in exposureRows" :key="row.label">
-              <dt class="mb-0.5 text-xs text-ink-2">{{ row.label }}</dt>
-              <dd class="text-ink">
-                {{ row.value }}
-                <span v-if="row.sub" class="block text-[11px] leading-4 text-ink-3">{{ row.sub }}</span>
-              </dd>
+          <template v-else>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">拍摄时间</dt>
+              <dd class="text-ink">{{ info?.shootTime ?? "—" }}</dd>
             </div>
-          </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">分辨率</dt>
-            <dd class="text-ink">{{ info?.width && info?.height ? `${info.width} × ${info.height}` : "—" }}</dd>
-          </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">大小</dt>
-            <dd class="text-ink">{{ formatBytes(singleItem.size) }}</dd>
-          </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">修改时间</dt>
-            <dd class="text-ink">{{ fmtDate(singleItem.mtimeSecs) }}</dd>
-          </div>
-          <div>
-            <dt class="mb-0.5 text-xs text-ink-2">位置</dt>
-            <dd class="break-all text-ink-2">{{ relDir(singleItem) }}</dd>
-          </div>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">相机</dt>
+              <dd class="text-ink">{{ cameraLabel(info) ?? "—" }}</dd>
+            </div>
+            <div v-if="info?.lens">
+              <dt class="mb-0.5 text-xs text-ink-2">镜头</dt>
+              <dd class="break-words text-ink">{{ info.lens }}</dd>
+            </div>
+            <!-- 曝光四件套：两列排布，缺项自动不占位（视频/无 EXIF 时不显示整块） -->
+            <div v-if="exposureRows.length" class="grid grid-cols-2 gap-x-3 gap-y-2.5">
+              <div v-for="row in exposureRows" :key="row.label">
+                <dt class="mb-0.5 text-xs text-ink-2">{{ row.label }}</dt>
+                <dd class="text-ink">
+                  {{ row.value }}
+                  <span v-if="row.sub" class="block text-[11px] leading-4 text-ink-3">{{ row.sub }}</span>
+                </dd>
+              </div>
+            </div>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">分辨率</dt>
+              <dd class="text-ink">{{ info?.width && info?.height ? `${info.width} × ${info.height}` : "—" }}</dd>
+            </div>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">大小</dt>
+              <dd class="text-ink">{{ formatBytes(singleItem.size) }}</dd>
+            </div>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">修改时间</dt>
+              <dd class="text-ink">{{ fmtDate(singleItem.mtimeSecs) }}</dd>
+            </div>
+            <div>
+              <dt class="mb-0.5 text-xs text-ink-2">位置</dt>
+              <dd class="break-all text-ink-2">{{ relDir(singleItem) }}</dd>
+            </div>
+          </template>
         </dl>
+        <p v-else class="px-5 pb-3 text-xs leading-5 text-ink-2">
+          评分与收藏会同时写入这 {{ rateTargets.length }} 个文件；只写本地数据库，不动照片。
+        </p>
 
         <div class="mt-auto border-t border-line p-4">
           <button
+            v-if="singleItem"
             class="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg bg-subtle text-xs text-ink-2 transition-colors hover:bg-hover"
             @click="invoke('open_in_explorer', { path: singleItem.path })"
           >
             <FolderOpen class="size-3.5" />
             打开所在文件夹
           </button>
+          <p v-else class="text-center text-[11px] leading-5 text-ink-3">
+            0-5 打分 · 空格收藏 · Esc 取消选择
+          </p>
         </div>
       </template>
-
-      <div v-else class="grid flex-1 place-items-center px-6">
-        <div class="text-center">
-          <p class="text-xs leading-5 text-ink-3">
-            {{
-              selected.size > 1
-                ? `已选 ${selected.size} 项`
-                : "选中一张照片或视频查看信息"
-            }}
-          </p>
-          <!-- 键盘提示：挑片动作的发现成本（用户不知道有快捷键等于没有） -->
-          <p v-if="selected.size <= 1 && displayItems.length" class="mt-3 text-[11px] leading-5 text-ink-3">
-            方向键选择 · Shift 扩选 · Enter 打开<br />
-            空格收藏 · 0-5 打分 · Ctrl+A 全选 · Esc 取消
-          </p>
-          <!-- 批量评分：评分与格式无关，选中项全部参与 -->
-          <div v-if="selected.size > 1" class="mt-4">
-            <div class="mb-1.5 flex items-center justify-center gap-2 text-xs text-ink-3">
-              <span>批量评分（{{ rateTargets.length }} 个文件）</span>
-              <button
-                class="grid size-6 place-items-center rounded-md border border-line bg-surface transition-colors hover:bg-hover disabled:opacity-50"
-                :disabled="favBusy"
-                :title="allSelectedFav ? '取消选区收藏（空格）' : '收藏选区（空格）'"
-                :aria-pressed="allSelectedFav"
-                @click="onToggleFavorite()"
-              >
-                <Heart
-                  class="size-3.5"
-                  :class="allSelectedFav ? 'fill-current' : ''"
-                  :style="{ color: allSelectedFav ? 'var(--fav-on)' : 'var(--star-off)' }"
-                  :stroke-width="allSelectedFav ? 0 : 2"
-                />
-              </button>
-            </div>
-            <div
-              class="flex items-center justify-center gap-0.5"
-              @mouseleave="hoverRating = 0"
-            >
-              <button
-                v-for="i in 5"
-                :key="i"
-                class="rounded p-0.5 transition-transform"
-                :class="{ 'scale-110': hoverRating === i, 'opacity-50': ratingBusy }"
-                :disabled="ratingBusy"
-                :title="`${i} 星`"
-                @mouseenter="hoverRating = i"
-                @click="onRate(i)"
-              >
-                <Star
-                  class="size-[18px] fill-current transition-colors"
-                  :style="starStyle(i, hoverRating >= i)"
-                />
-              </button>
-            </div>
-            <p v-if="favError || ratingError" class="mt-2 text-xs text-bad">{{ favError || ratingError }}</p>
-            <p v-else-if="ratingBusy || favBusy" class="mt-2 text-xs text-ink-3">正在保存…</p>
-          </div>
-        </div>
-      </div>
     </aside>
   </div>
 </template>

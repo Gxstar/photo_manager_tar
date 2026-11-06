@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from "vue";
 // window.confirm 在该 WebView 返回 Promise（恒真），必须用原生对话框插件
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, HardDrive, FileStack, Save, TriangleAlert } from "lucide-vue-next";
+import { Check, Copy, FolderOpen, FolderPen, HardDrive, FileStack, TriangleAlert } from "lucide-vue-next";
 import {
   store,
   loadConfig,
@@ -17,6 +17,25 @@ import {
 const saving = ref(false);
 const error = ref(null);
 const behaviorError = ref(null);
+
+// 复制路径 / 已保存：都给一次短反馈，避免"点了没反应"
+const copied = ref(false);
+let copiedTimer = 0;
+const savedFlash = ref(false);
+let savedTimer = 0;
+
+async function copyRoot() {
+  const root = store.config?.libraryRoot;
+  if (!root) return;
+  try {
+    await navigator.clipboard.writeText(root);
+    copied.value = true;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => (copied.value = false), 1600);
+  } catch {
+    error.value = "复制失败，可双击路径手动选中";
+  }
+}
 
 const autoScan = computed(() => store.config?.autoScan !== false);
 
@@ -104,6 +123,9 @@ async function toggleAutoScan() {
   behaviorError.value = null;
   try {
     store.config = await invoke("set_auto_scan", { enabled: !autoScan.value });
+    savedFlash.value = true;
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => (savedFlash.value = false), 1600);
   } catch (e) {
     behaviorError.value = errMsg(e);
   }
@@ -152,12 +174,22 @@ async function saveRoot(dir) {
             {{ store.config?.libraryRoot || "未设置" }}
           </span>
         </div>
+        <!-- 路径框不可编辑：给它一个明确的"复制"出口，而不是让用户对着假输入框点 -->
+        <button
+          class="grid size-9 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
+          :disabled="!store.config?.libraryRoot"
+          :title="copied ? '已复制' : '复制路径'"
+          @click="copyRoot"
+        >
+          <Check v-if="copied" class="size-4 text-ok" />
+          <Copy v-else class="size-4" />
+        </button>
         <button
           class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
           :disabled="saving"
           @click="pickLibraryRoot"
         >
-          <Save class="size-4" />
+          <FolderPen class="size-4" />
           更改
         </button>
       </div>
@@ -203,7 +235,10 @@ async function saveRoot(dir) {
       <h2 class="mb-3 text-sm font-semibold">行为</h2>
       <div class="flex items-center justify-between gap-4">
         <div class="min-w-0">
-          <div class="text-sm">插卡后自动扫描</div>
+          <div class="flex items-center gap-1.5 text-sm">
+            插卡后自动扫描
+            <span v-if="savedFlash" class="text-[11px] font-normal text-ok">已保存</span>
+          </div>
           <p class="mt-0.5 text-xs leading-relaxed text-ink-2">
             检测到相机卡后自动生成归档计划。扫描只读卡、不改卡，仍需手动点「开始拷贝」
           </p>
@@ -235,7 +270,7 @@ async function saveRoot(dir) {
           </p>
         </div>
         <button
-          class="h-8 shrink-0 rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover disabled:opacity-55"
+          class="h-8 shrink-0 rounded-lg border border-bad/40 px-3 text-xs text-bad transition-colors hover:bg-bad-soft disabled:opacity-55"
           :disabled="clearing"
           @click="clearLog"
         >
