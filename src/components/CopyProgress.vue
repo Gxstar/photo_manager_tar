@@ -17,11 +17,12 @@ const pct = computed(() => {
 <template>
   <div class="rounded-card border border-line bg-surface p-4 shadow-card">
     <div class="mb-2 flex items-baseline justify-between">
-      <span class="text-sm font-medium">
-        正在拷贝 {{ progress.doneFiles }} / {{ progress.totalFiles }} 个文件
-        <span class="ml-2 text-xs font-normal text-ink-2">
+      <span class="flex items-baseline gap-2 text-sm font-medium">
+        <span>正在拷贝 {{ progress.doneFiles }} / {{ progress.totalFiles }} 个文件</span>
+        <span class="text-xs font-normal text-ink-2">
           {{ formatBytes(progress.doneBytes) }} / {{ formatBytes(progress.totalBytes) }}
         </span>
+        <span class="text-xs font-normal text-ink-2 tabular-nums">{{ Math.round(pct) }}%</span>
       </span>
       <button
         class="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-xs text-ink-2 transition-colors hover:border-bad hover:text-bad"

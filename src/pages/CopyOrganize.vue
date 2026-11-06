@@ -146,8 +146,23 @@ function onCopyEvent(msg) {
         avgBps: msg.data.avgBytesPerSec,
       };
       // 拷贝完成后本地刷新三态（已拷的标已拷贝）
-      for (const f of store.plan?.files ?? []) {
+      const files = store.plan?.files ?? [];
+      for (const f of files) {
         if (f.status === "new") f.status = "copied";
+      }
+      // 汇总数字是扫描时的快照，不重算的话「待拷 1179 个」会留在页面上、
+      // 「开始拷贝」也还是可点的 —— 与实际状态矛盾
+      let restFiles = 0;
+      let restBytes = 0;
+      for (const f of files) {
+        if (f.status === "new") {
+          restFiles++;
+          restBytes += f.size;
+        }
+      }
+      if (store.plan) {
+        store.plan.newFiles = restFiles;
+        store.plan.newBytes = restBytes;
       }
       // 库内容变了：下次进入无卡空态必须重取（拔卡后展示刚导入的照片）
       resetHome();
@@ -306,9 +321,12 @@ async function cancelCopy() {
 
             <div class="flex items-center gap-4">
               <span class="text-sm text-ink-2">
-                待拷
-                <b class="text-ink">{{ store.plan.newFiles }}</b> 个文件 ·
-                {{ formatBytes(store.plan.newBytes) }}
+                <template v-if="store.plan.newFiles">
+                  待拷
+                  <b class="text-ink">{{ store.plan.newFiles }}</b> 个文件 ·
+                  {{ formatBytes(store.plan.newBytes) }}
+                </template>
+                <span v-else>没有待拷文件</span>
                 <template v-if="store.plan.existsFiles">
                   · 跳过已存在 {{ store.plan.existsFiles }} 个
                 </template>
