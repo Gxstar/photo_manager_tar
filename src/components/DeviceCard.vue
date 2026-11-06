@@ -40,7 +40,7 @@ const emit = defineEmits(["select"]);
       <div class="flex flex-wrap gap-1.5">
         <span
           v-if="device.isCameraCard"
-          class="rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-deep"
+          class="rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
         >
           相机卡{{ device.cardKind ? ` · ${device.cardKind}` : '' }}
         </span>

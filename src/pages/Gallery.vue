@@ -63,7 +63,7 @@ const rowH = computed(() => thumbH.value + LABEL_H); // 行内容高
 function measure() {
   const w = contentEl.value?.clientWidth ?? 0;
   if (w <= 0) return;
-  cols.value = Math.max(2, Math.floor((w + GAP) / (cellMin.value + GAP)));
+  cols.value = Math.max(2, Math.round((w + GAP) / (cellMin.value + GAP)));
   cellW.value = (w - (cols.value - 1) * GAP) / cols.value;
   scheduleSticky(); // 宽度变了行可能重排，下一帧重算吸顶组
 }
@@ -932,6 +932,12 @@ function relDir(item) {
     <!-- 全宽工具条：横跨网格区 + 信息栏，不再受网格区宽度限制 -->
     <div class="col-span-2 flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line px-6 py-1.5 text-sm">
       <template v-if="store.gallery.items.length">
+        <!-- 阈值一旦生效，星星靠颜色表达不够明确，用文字再标一次 -->
+        <span
+          v-if="minStars"
+          class="shrink-0 whitespace-nowrap rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
+          :title="`只看 ≥${minStars}★ `"
+        >≥{{ minStars }}★</span>
         <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
         <span v-if="kindFilter !== 'all' || ratingFilter !== 'all' || favoriteFilter" class="shrink-0 whitespace-nowrap text-xs text-ink-3">
           / 共 {{ store.gallery.items.length.toLocaleString() }} 项
@@ -946,7 +952,7 @@ function relDir(item) {
       <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
       <span v-if="openError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="openError">{{ openError }}</span>
       <div v-if="store.gallery.items.length" class="ml-auto flex shrink-0 items-center gap-1.5">
-        <div class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5">
+        <div class="flex h-7 items-center gap-0.5 rounded-lg bg-subtle p-0.5">
           <button
             v-for="opt in filterOpts"
             :key="opt.value"
@@ -964,7 +970,7 @@ function relDir(item) {
 
         <!-- 评分筛选：星级阈值（点第 N 颗 = ≥N★），评分覆盖全部媒体格式 -->
         <div
-          class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
+          class="flex h-7 items-center gap-0.5 rounded-lg bg-subtle p-0.5"
           :title="minStars ? `显示 ≥${minStars}★ 的文件（再点同一颗星取消）` : '按星级筛选（评分覆盖全部媒体格式）'"
           @mouseleave="hoverStars = 0"
         >
@@ -1248,7 +1254,7 @@ function relDir(item) {
                dt/dd 横排、紧凑 padding，避免顶部占位过高挤掉元数据 -->
           <div class="rounded-card border border-line bg-subtle px-3 py-2">
             <div class="flex items-center justify-between gap-2">
-              <dt class="shrink-0 text-xs text-ink-3">评分</dt>
+              <dt class="shrink-0 text-xs text-ink-2">评分</dt>
               <dd class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
                 <button
                   v-for="i in 5"
@@ -1274,7 +1280,7 @@ function relDir(item) {
               </dd>
             </div>
             <div class="mt-1.5 flex items-center justify-between gap-2 border-t border-line pt-1.5">
-              <dt class="shrink-0 text-xs text-ink-3">收藏</dt>
+              <dt class="shrink-0 text-xs text-ink-2">收藏</dt>
               <dd class="flex items-center gap-2">
                 <button
                   class="grid size-6 place-items-center rounded-lg border border-line bg-surface transition-colors hover:bg-hover disabled:opacity-50"
@@ -1299,21 +1305,21 @@ function relDir(item) {
             <p v-if="favError || ratingError" class="mt-1 text-xs text-bad">{{ favError || ratingError }}</p>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">拍摄时间</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">拍摄时间</dt>
             <dd class="text-ink">{{ info?.shootTime ?? "—" }}</dd>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">相机</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">相机</dt>
             <dd class="text-ink">{{ cameraLabel(info) ?? "—" }}</dd>
           </div>
           <div v-if="info?.lens">
-            <dt class="mb-0.5 text-xs text-ink-3">镜头</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">镜头</dt>
             <dd class="break-words text-ink">{{ info.lens }}</dd>
           </div>
           <!-- 曝光四件套：两列排布，缺项自动不占位（视频/无 EXIF 时不显示整块） -->
           <div v-if="exposureRows.length" class="grid grid-cols-2 gap-x-3 gap-y-2.5">
             <div v-for="row in exposureRows" :key="row.label">
-              <dt class="mb-0.5 text-xs text-ink-3">{{ row.label }}</dt>
+              <dt class="mb-0.5 text-xs text-ink-2">{{ row.label }}</dt>
               <dd class="text-ink">
                 {{ row.value }}
                 <span v-if="row.sub" class="block text-[11px] leading-4 text-ink-3">{{ row.sub }}</span>
@@ -1321,19 +1327,19 @@ function relDir(item) {
             </div>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">分辨率</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">分辨率</dt>
             <dd class="text-ink">{{ info?.width && info?.height ? `${info.width} × ${info.height}` : "—" }}</dd>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">大小</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">大小</dt>
             <dd class="text-ink">{{ formatBytes(singleItem.size) }}</dd>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">修改时间</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">修改时间</dt>
             <dd class="text-ink">{{ fmtDate(singleItem.mtimeSecs) }}</dd>
           </div>
           <div>
-            <dt class="mb-0.5 text-xs text-ink-3">位置</dt>
+            <dt class="mb-0.5 text-xs text-ink-2">位置</dt>
             <dd class="break-all text-ink-2">{{ relDir(singleItem) }}</dd>
           </div>
         </dl>

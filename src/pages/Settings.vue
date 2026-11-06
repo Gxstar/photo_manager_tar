@@ -153,7 +153,7 @@ async function saveRoot(dir) {
           </span>
         </div>
         <button
-          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-white transition-colors hover:bg-amber-deep disabled:opacity-55"
+          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
           :disabled="saving"
           @click="pickLibraryRoot"
         >
@@ -284,7 +284,7 @@ async function saveRoot(dir) {
       <p v-if="interopError" class="mt-2 flex items-center gap-1 text-xs text-bad">
         <TriangleAlert class="size-3.5" /> {{ interopError }}
       </p>
-      <p class="mt-3 border-t border-line pt-3 text-[11px] leading-4 text-ink-3">
+      <p class="mt-3 border-t border-line pt-3 text-xs leading-5 text-ink-2">
         评分数据库：<span class="break-all">{{ dbPath || "—" }}</span>（换电脑 / 重装前请备份此文件）。
         Windows 资源管理器不读 sidecar，其「分级」列不会显示——这是保持原图只读的取舍。
       </p>

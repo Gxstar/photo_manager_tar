@@ -47,7 +47,7 @@ const groups = computed(() => {
 });
 
 const statusMeta = {
-  new: { label: "新增", cls: "bg-amber-soft text-amber-deep" },
+  new: { label: "新增", cls: "bg-amber-soft text-amber-text" },
   exists: { label: "已存在", cls: "bg-ok-soft text-ok" },
   conflict: { label: "冲突", cls: "bg-bad-soft text-bad" },
   suspectSkipped: { label: "改名跳过", cls: "bg-warn-soft text-warn" },
@@ -91,7 +91,7 @@ const kindIcon = (f) =>
         </span>
 
         <span class="ml-auto flex items-center gap-3 text-xs text-ink-2 tabular-nums">
-          <span v-if="g.newCount" class="text-amber-deep">新增 {{ g.newCount }} · {{ formatBytes(g.newBytes) }}</span>
+          <span v-if="g.newCount" class="text-amber-text">新增 {{ g.newCount }} · {{ formatBytes(g.newBytes) }}</span>
           <span v-if="g.existsCount">已存在 {{ g.existsCount }}</span>
           <span v-if="g.suspectCount" class="text-warn">改名跳过 {{ g.suspectCount }}</span>
           <span v-if="g.copiedCount" class="text-ok">已拷 {{ g.copiedCount }}</span>

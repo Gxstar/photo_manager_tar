@@ -218,7 +218,7 @@ async function cancelCopy() {
       <!-- 扫描 -->
       <section v-if="selected?.hasMedia" class="flex items-center gap-3">
         <button
-          class="flex h-9 items-center gap-2 rounded-lg bg-amber px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
+          class="flex h-9 items-center gap-2 rounded-lg bg-amber px-4 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
           :disabled="store.scanning || store.copying"
           @click="pickAndScan"
         >
@@ -318,7 +318,7 @@ async function cancelCopy() {
                 目标盘剩余 {{ formatBytes(store.plan.freeBytes) }}，还差 {{ formatBytes(deficit) }}
               </span>
               <button
-                class="ml-auto h-10 rounded-xl bg-amber px-6 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
+                class="ml-auto h-10 rounded-xl bg-amber px-6 text-sm font-semibold text-ink ring-1 ring-inset ring-amber-deep/45 shadow-sm transition-colors hover:bg-amber-deep disabled:cursor-not-allowed disabled:opacity-55"
                 :disabled="!store.plan.spaceOk || store.plan.newFiles === 0"
                 @click="startCopy"
               >

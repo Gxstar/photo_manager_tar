@@ -11,19 +11,22 @@
   --color-hover: #efeae2;        /* 悬停 */
   --color-line: #e5dfd5;         /* 常规描边 */
   --color-line-strong: #d6cdc0;  /* 强描边 */
-  --color-ink: #2e2a24;          /* 主文字：暖黑 */
-  --color-ink-2: #7b7367;        /* 次级文字 */
-  --color-ink-3: #a9a196;        /* 弱化文字 */
-  --color-amber: #f59e0b;        /* 琥珀强调 */
-  --color-amber-deep: #d98207;   /* 琥珀悬停 */
+  --color-ink: #2e2a24;          /* 主文字：暖黑。白底 12.8:1 */
+  --color-ink-2: #7b7367;        /* 次级文字。白底 4.68:1 / subtle 4.41:1（AA） */
+  /* 三级灰只用于图标、分隔、角标等非正文；白底 4.17:1、app 底 3.96:1。
+     正文（含 12px 标签）一律用 ink-2 —— 原值 #a9a196 仅 2.55:1，不可读。 */
+  --color-ink-3: #7f776a;
+  --color-amber: #f59e0b;        /* 琥珀强调：选中/进度/描边。实心按钮文字用 ink（6.64:1） */
+  --color-amber-deep: #d98207;   /* 琥珀悬停底色（仅作背景，不当文字色） */
+  --color-amber-text: #8a5a00;   /* 琥珀浅底上的文字。对 amber-soft 5.43:1 */
   --color-amber-soft: #fef4e2;   /* 琥珀浅底 */
-  --color-ok: #6e9b78;           /* 已存在：低饱和绿 */
+  --color-ok: #4f7a5c;           /* 已存在：低饱和绿。对 ok-soft 4.4:1 / 白底 4.9:1 */
   --color-ok-soft: #edf4ee;
-  --color-info: #7e8c99;         /* 中性：灰蓝 */
+  --color-info: #5b6976;         /* 中性：灰蓝。对 info-soft 4.96:1 */
   --color-info-soft: #edf1f5;
-  --color-warn: #c99a3e;         /* 警告 */
+  --color-warn: #8a6414;         /* 警告。对 warn-soft 4.85:1 */
   --color-warn-soft: #fbf3e0;
-  --color-bad: #c25b4e;          /* 冲突 / 失败：低饱和红 */
+  --color-bad: #a34437;          /* 冲突 / 失败：低饱和红。对 bad-soft 5.34:1 */
   --color-bad-soft: #faedea;
   --radius-card: 14px;
   --shadow-card: 0 1px 2px rgb(46 42 36 / 0.04), 0 4px 16px rgb(46 42 36 / 0.06);

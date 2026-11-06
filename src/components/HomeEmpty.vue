@@ -103,7 +103,7 @@ onMounted(() => {
         }}
       </p>
       <button
-        class="h-9 rounded-lg bg-amber px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-deep"
+        class="h-9 rounded-lg bg-amber px-4 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 shadow-sm transition-colors hover:bg-amber-deep"
         @click="store.page = 'settings'"
       >
         去设置
@@ -120,8 +120,8 @@ onMounted(() => {
               加载中…
             </span>
           </h3>
-          <span v-if="months[0]" class="text-xs text-ink-3">
-            {{ months[0].label }} · {{ months[0].files.toLocaleString() }} 个文件 ·
+          <span v-if="months[0]" class="text-xs text-ink-2">
+            最新归档 {{ months[0].label }} · {{ months[0].files.toLocaleString() }} 个文件 ·
             {{ formatBytes(months[0].bytes) }}
           </span>
         </div>
@@ -221,7 +221,7 @@ onMounted(() => {
       <!-- 入口 -->
       <div class="mt-1 flex items-center gap-2">
         <button
-          class="flex h-9 items-center gap-1.5 rounded-lg bg-amber px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-deep"
+          class="flex h-9 items-center gap-1.5 rounded-lg bg-amber px-4 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 shadow-sm transition-colors hover:bg-amber-deep"
           @click="store.page = 'gallery'"
         >
           <Images class="size-4" /> 打开图库
