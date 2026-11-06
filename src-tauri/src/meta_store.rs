@@ -1,17 +1,19 @@
-//! 图库元数据持久缓存（SQLite）。
+//! 图库 SQLite 持久层（docs/开发方案.md §10）。
 //!
-//! 表 `meta_cache`：(path, mtime) → (shoot_time, rating)。行存在即「已探测」：
-//! - shoot_time NULL = 探测过但该文件无权威时间
-//! - rating NULL = 不可评分格式（不适用）；0 = 可评分格式已确认无评分；1-5 = 评分
+//! 两类数据**分表**，生命周期不同：
+//! - `meta_cache`：拍摄时间缓存（path → mtime/shoot_time），**可重建**，删了会重扫。
+//! - `ratings`：评分**权威源**（path → 1-5），用户数据，删了不可恢复。
+//!   无评分 = 无行，清除评分 = DELETE；绝不写回图片文件。
+//! - `import_log` / `import_failure`：每次拷贝的汇总与失败明细。
 //!
-//! 生命周期：应用启动 `open` + `load_all` 灌入进程内缓存；补齐批次与打分
-//! 成功后 UPSERT 回写。打开失败时降级为纯内存模式（写入 no-op），不阻塞应用。
+//! 旧库文件的 `meta_cache.rating` 列保留但忽略（nullable，INSERT 不指定即可），
+//! 因此不需要迁移脚本。DB 打开失败时降级为纯内存：缓存类操作 no-op，
+//! 但**评分写入必须报错**（硬规则 #14），由命令层转成前端可见的错误。
 
-use crate::gallery::TimePatch;
-use crate::gallery::{RatingCache, TimeCache};
+use crate::gallery::{TimeCache, TimePatch};
 use crate::models::{ImportFailure, ImportLog};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub struct MetaStore {
@@ -38,8 +40,16 @@ impl MetaStore {
                     "CREATE TABLE IF NOT EXISTS meta_cache (
                         path       TEXT PRIMARY KEY,
                         mtime      INTEGER NOT NULL,
-                        shoot_time TEXT,
-                        rating     INTEGER
+                        shoot_time TEXT
+                    ) WITHOUT ROWID;
+                    CREATE TABLE IF NOT EXISTS ratings (
+                        path       TEXT PRIMARY KEY,
+                        rating     INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                        updated_at TEXT NOT NULL
+                    ) WITHOUT ROWID;
+                    CREATE TABLE IF NOT EXISTS favorites (
+                        path       TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL
                     ) WITHOUT ROWID;
                     CREATE TABLE IF NOT EXISTS import_log (
                         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,70 +85,220 @@ impl MetaStore {
         }
     }
 
-    /// 启动装载：返回 (时间缓存, 评分缓存)，与进程内缓存结构一致
-    pub fn load_all(&self) -> (TimeCache, RatingCache) {
-        let mut times = HashMap::new();
-        let mut ratings = HashMap::new();
-        let Some(conn) = &self.conn else {
-            return (times, ratings);
-        };
-        let Ok(db) = conn.lock() else { return (times, ratings) };
-        let Ok(mut stmt) =
-            db.prepare("SELECT path, mtime, shoot_time, rating FROM meta_cache")
-        else {
-            return (times, ratings);
-        };
-        let _ = stmt.query_map([], |row| {
-            let path: String = row.get(0)?;
-            let mtime: i64 = row.get(1)?;
-            let shoot_time: Option<String> = row.get(2)?;
-            let rating: Option<i64> = row.get(3)?;
-            Ok((path, mtime, shoot_time, rating))
-        })
-        .map(|rows| {
-            for row in rows.flatten() {
-                let (path, mtime, shoot_time, rating) = row;
-                times.insert(path.clone(), (mtime, shoot_time));
-                if let Some(r) = rating.filter(|r| (0..=5).contains(r)) {
-                    ratings.insert(path, (mtime, (r > 0).then_some(r as u8)));
-                }
-            }
-        });
-        (times, ratings)
+    /// 评分是否可持久化。false 时命令层必须报错，不允许静默成功
+    pub fn is_available(&self) -> bool {
+        self.conn.is_some()
     }
 
-    /// 补齐批次回写：时间 + 评分一并 UPSERT（单事务）
+    /// 供设置页展示：备份时要复制的就是这个文件
+    pub fn db_location(&self) -> String {
+        db_path().to_string_lossy().to_string()
+    }
+
+    /// 启动装载：拍摄时间缓存
+    pub fn load_times(&self) -> TimeCache {
+        let mut times = HashMap::new();
+        let Some(conn) = &self.conn else { return times };
+        let Ok(db) = conn.lock() else { return times };
+        let Ok(mut stmt) = db.prepare("SELECT path, mtime, shoot_time FROM meta_cache") else {
+            return times;
+        };
+        let _ = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map(|rows| {
+                for row in rows.flatten() {
+                    let (path, mtime, shoot_time) = row;
+                    times.insert(path, (mtime, shoot_time));
+                }
+            });
+        times
+    }
+
+    /// 评分权威值：path → 1-5（无评分的文件不在表里）
+    pub fn all_ratings(&self) -> HashMap<String, u8> {
+        let mut out = HashMap::new();
+        let Some(conn) = &self.conn else { return out };
+        let Ok(db) = conn.lock() else { return out };
+        let Ok(mut stmt) = db.prepare("SELECT path, rating FROM ratings") else {
+            return out;
+        };
+        let _ = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map(|rows| {
+                for row in rows.flatten() {
+                    let (path, r) = row;
+                    if (1..=5).contains(&r) {
+                        out.insert(path, r as u8);
+                    }
+                }
+            });
+        out
+    }
+
+    /// 时间补齐批次回写（单事务，不含评分）
     pub fn upsert_patches(&self, patches: &[TimePatch]) {
         let Some(conn) = &self.conn else { return };
         let Ok(db) = conn.lock() else { return };
         let _ = db.execute_batch("BEGIN;");
         if let Ok(mut stmt) = db.prepare_cached(
-            "INSERT INTO meta_cache (path, mtime, shoot_time, rating) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO meta_cache (path, mtime, shoot_time) VALUES (?1, ?2, ?3)
              ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime,
-                 shoot_time = excluded.shoot_time, rating = excluded.rating",
+                 shoot_time = excluded.shoot_time",
         ) {
             for p in patches {
-                let ratable = crate::meta::xmp::is_ratable(Path::new(&p.path));
-                // 可评分文件：0 = 已确认无评分（区别于 NULL = 类型不支持）
-                let rating = if ratable { Some(i64::from(p.rating.unwrap_or(0))) } else { None };
-                let _ = stmt.execute(rusqlite::params![p.path, p.mtime_secs, p.shoot_time, rating]);
+                let _ = stmt.execute(rusqlite::params![p.path, p.mtime_secs, p.shoot_time]);
             }
         }
         let _ = db.execute_batch("COMMIT;");
     }
 
-    /// 打分成功后的单条回写（rating None = 清除，存 0）
-    pub fn upsert_rating(&self, path: &str, mtime: i64, rating: Option<u8>) {
-        let Some(conn) = &self.conn else { return };
-        let Ok(db) = conn.lock() else { return };
-        let _ = db
-            .prepare_cached(
-                "INSERT INTO meta_cache (path, mtime, shoot_time, rating) VALUES (?1, ?2, NULL, ?3)
-                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, rating = excluded.rating",
-            )
-            .and_then(|mut s| {
-                s.execute(rusqlite::params![path, mtime, i64::from(rating.unwrap_or(0))])
+    /// 批量打分 / 清除评分（单个事务）。rating=None = 删除这些行。
+    /// DB 不可用或写失败一律返回 Err —— 绝不假装保存成功。
+    pub fn set_ratings_batch(
+        &self,
+        paths: &[String],
+        rating: Option<u8>,
+    ) -> Result<usize, String> {
+        let Some(conn) = &self.conn else {
+            return Err("评分数据库不可用，评分未保存".into());
+        };
+        let mut db = conn
+            .lock()
+            .map_err(|_| "评分数据库被占用，评分未保存".to_string())?;
+        let tx = db
+            .transaction()
+            .map_err(|e| format!("评分保存失败: {e}"))?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let n = match rating {
+            Some(v) => {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "INSERT INTO ratings (path, rating, updated_at) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(path) DO UPDATE SET rating = excluded.rating,
+                             updated_at = excluded.updated_at",
+                    )
+                    .map_err(|e| format!("评分保存失败: {e}"))?;
+                let mut n = 0;
+                for p in paths {
+                    n += stmt
+                        .execute(rusqlite::params![p, v, now])
+                        .map_err(|e| format!("评分保存失败: {e}"))?;
+                }
+                n
+            }
+            None => {
+                let mut stmt = tx
+                    .prepare_cached("DELETE FROM ratings WHERE path = ?1")
+                    .map_err(|e| format!("评分保存失败: {e}"))?;
+                let mut n = 0;
+                for p in paths {
+                    n += stmt
+                        .execute(rusqlite::params![p])
+                        .map_err(|e| format!("评分保存失败: {e}"))?;
+                }
+                n
+            }
+        };
+        tx.commit().map_err(|e| format!("评分保存失败: {e}"))?;
+        Ok(n)
+    }
+
+    /// 收藏集合：path 存在即为已收藏（与 ratings 分表，互不派生）
+    pub fn all_favorites(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let Some(conn) = &self.conn else { return out };
+        let Ok(db) = conn.lock() else { return out };
+        let Ok(mut stmt) = db.prepare("SELECT path FROM favorites") else {
+            return out;
+        };
+        let _ = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                for p in rows.flatten() {
+                    out.insert(p);
+                }
             });
+        out
+    }
+
+    /// 批量收藏 / 取消收藏（单事务）。DB 不可用或写失败一律 Err，不静默成功。
+    pub fn set_favorites_batch(
+        &self,
+        paths: &[String],
+        favorite: bool,
+    ) -> Result<usize, String> {
+        let Some(conn) = &self.conn else {
+            return Err("评分数据库不可用，收藏未保存".into());
+        };
+        let mut db = conn
+            .lock()
+            .map_err(|_| "评分数据库被占用，收藏未保存".to_string())?;
+        let tx = db
+            .transaction()
+            .map_err(|e| format!("收藏保存失败: {e}"))?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let n = if favorite {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO favorites (path, created_at) VALUES (?1, ?2)",
+                )
+                .map_err(|e| format!("收藏保存失败: {e}"))?;
+            let mut n = 0;
+            for p in paths {
+                n += stmt
+                    .execute(rusqlite::params![p, now])
+                    .map_err(|e| format!("收藏保存失败: {e}"))?;
+            }
+            n
+        } else {
+            let mut stmt = tx
+                .prepare_cached("DELETE FROM favorites WHERE path = ?1")
+                .map_err(|e| format!("收藏保存失败: {e}"))?;
+            let mut n = 0;
+            for p in paths {
+                n += stmt
+                    .execute(rusqlite::params![p])
+                    .map_err(|e| format!("收藏保存失败: {e}"))?;
+            }
+            n
+        };
+        tx.commit().map_err(|e| format!("收藏保存失败: {e}"))?;
+        Ok(n)
+    }
+
+    /// 一次性从文件内嵌 XMP 导入评分：只插不覆盖（用户已在本工具打的分优先）
+    pub fn insert_ratings(&self, entries: &[(String, u8)]) -> Result<usize, String> {
+        let Some(conn) = &self.conn else {
+            return Err("评分数据库不可用，导入未保存".into());
+        };
+        let mut db = conn
+            .lock()
+            .map_err(|_| "评分数据库被占用，导入未保存".to_string())?;
+        let tx = db.transaction().map_err(|e| format!("导入失败: {e}"))?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut n = 0;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO ratings (path, rating, updated_at) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| format!("导入失败: {e}"))?;
+            for (p, r) in entries {
+                n += stmt
+                    .execute(rusqlite::params![p, r, now])
+                    .map_err(|e| format!("导入失败: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("导入失败: {e}"))?;
+        Ok(n)
     }
 
     // ── 导入日志 ─────────────────────────────────────────────────────────
@@ -265,7 +425,14 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta_cache (
-                path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, shoot_time TEXT, rating INTEGER
+                path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, shoot_time TEXT
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS ratings (
+                path TEXT PRIMARY KEY, rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                updated_at TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS favorites (
+                path TEXT PRIMARY KEY, created_at TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS import_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, finished_at TEXT NOT NULL,
@@ -286,55 +453,123 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_and_overwrite() {
+    fn times_and_ratings_roundtrip() {
         let (store, dir) = temp_store("rt");
         store.upsert_patches(&[
             TimePatch {
                 path: "a.jpg".into(),
                 mtime_secs: 100,
                 shoot_time: Some("2026-01-01 10:00:00".into()),
-                rating: Some(4),
             },
             TimePatch {
                 path: "b.RW2".into(),
                 mtime_secs: 200,
                 shoot_time: Some("2026-02-02 11:00:00".into()),
-                rating: None,
-            },
-            TimePatch {
-                path: "c.mp4".into(),
-                mtime_secs: 400,
-                shoot_time: Some("2026-03-03 12:00:00".into()),
-                rating: None,
             },
         ]);
-        store.upsert_patches(&[TimePatch {
-            path: "a.jpg".into(),
-            mtime_secs: 300, // 重新打分后 mtime 变化
-            shoot_time: Some("2026-01-01 10:00:00".into()),
-            rating: Some(5),
-        }]);
-        store.upsert_rating("a.jpg", 300, None); // 清除评分
-
-        let (times, ratings) = store.load_all();
-        assert_eq!(times.get("a.jpg"), Some(&(300, Some("2026-01-01 10:00:00".into()))));
+        let times = store.load_times();
+        assert_eq!(times.get("a.jpg"), Some(&(100, Some("2026-01-01 10:00:00".into()))));
         assert_eq!(times.get("b.RW2"), Some(&(200, Some("2026-02-02 11:00:00".into()))));
-        // 清除后 = 已探测无评分（0 → None）
-        assert_eq!(ratings.get("a.jpg"), Some(&(300, None)));
-        // 厂商 RAW 已明确不支持评分：写 NULL，不进评分缓存（拍摄时间仍照常缓存）
-        assert!(!ratings.contains_key("b.RW2"));
-        // 视频等不可评分类型同样写 NULL
-        assert!(!ratings.contains_key("c.mp4"));
+        assert!(store.all_ratings().is_empty(), "初始无评分");
+
+        // 评分与文件格式无关：RAW / 视频同样可评分
+        store
+            .set_ratings_batch(&["a.jpg".into(), "b.RW2".into(), "c.mp4".into()], Some(4))
+            .unwrap();
+        let ratings = store.all_ratings();
+        assert_eq!(ratings.get("a.jpg"), Some(&4));
+        assert_eq!(ratings.get("b.RW2"), Some(&4));
+        assert_eq!(ratings.get("c.mp4"), Some(&4));
+
+        // 清除 = 删行，不留 0 值
+        store.set_ratings_batch(&["a.jpg".into()], None).unwrap();
+        assert!(!store.all_ratings().contains_key("a.jpg"));
+
+        // 一次性导入只插不覆盖：已存在的 b.RW2 保持 4 星
+        store
+            .insert_ratings(&[("b.RW2".into(), 2), ("d.dng".into(), 5)])
+            .unwrap();
+        let ratings = store.all_ratings();
+        assert_eq!(ratings.get("b.RW2"), Some(&4));
+        assert_eq!(ratings.get("d.dng"), Some(&5));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 本次改造最核心的断言：打分 / 清除评分绝不触碰图片文件。
+    #[test]
+    fn scoring_never_touches_photo() {
+        let (store, dir) = temp_store("no-touch");
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"original-photo-bytes").unwrap();
+        let before = std::fs::read(&jpg).unwrap();
+        let mtime = std::fs::metadata(&jpg).unwrap().modified().unwrap();
+        let path = jpg.to_string_lossy().to_string();
+
+        store.set_ratings_batch(&[path.clone()], Some(4)).unwrap();
+        assert_eq!(store.all_ratings().get(&path), Some(&4));
+        assert_eq!(std::fs::read(&jpg).unwrap(), before, "内容零改动");
+        assert_eq!(std::fs::metadata(&jpg).unwrap().len(), before.len() as u64, "大小零改动");
+        assert_eq!(std::fs::metadata(&jpg).unwrap().modified().unwrap(), mtime, "mtime 零改动");
+
+        store.set_ratings_batch(&[path.clone()], None).unwrap();
+        assert!(!store.all_ratings().contains_key(&path));
+        assert_eq!(std::fs::read(&jpg).unwrap(), before, "清除评分也不改文件");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn degraded_mode_no_panic() {
+    fn favorites_roundtrip() {
+        let (store, dir) = temp_store("fav");
+        assert!(store.all_favorites().is_empty(), "初始无收藏");
+        store
+            .set_favorites_batch(&["a.jpg".into(), "b.RW2".into()], true)
+            .unwrap();
+        let fav = store.all_favorites();
+        assert_eq!(fav.len(), 2);
+        assert!(fav.contains("a.jpg") && fav.contains("b.RW2"));
+        // 重复收藏幂等
+        store.set_favorites_batch(&["a.jpg".into()], true).unwrap();
+        assert_eq!(store.all_favorites().len(), 2);
+        // 取消 = 删行
+        store.set_favorites_batch(&["a.jpg".into()], false).unwrap();
+        let fav = store.all_favorites();
+        assert!(!fav.contains("a.jpg"));
+        assert!(fav.contains("b.RW2"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 收藏同样绝不触碰图片文件（硬规则 #13）
+    #[test]
+    fn favorite_never_touches_photo() {
+        let (store, dir) = temp_store("fav-no-touch");
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"original-photo-bytes").unwrap();
+        let before = std::fs::read(&jpg).unwrap();
+        let mtime = std::fs::metadata(&jpg).unwrap().modified().unwrap();
+        let path = jpg.to_string_lossy().to_string();
+
+        store.set_favorites_batch(&[path.clone()], true).unwrap();
+        assert!(store.all_favorites().contains(&path));
+        assert_eq!(std::fs::read(&jpg).unwrap(), before, "内容零改动");
+        assert_eq!(std::fs::metadata(&jpg).unwrap().modified().unwrap(), mtime, "mtime 零改动");
+
+        store.set_favorites_batch(&[path.clone()], false).unwrap();
+        assert!(!store.all_favorites().contains(&path));
+        assert_eq!(std::fs::read(&jpg).unwrap(), before, "取消收藏也不改文件");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn degraded_mode_reports_error() {
         let store = MetaStore { conn: None };
+        assert!(!store.is_available());
+        assert!(store.set_ratings_batch(&["x".into()], Some(3)).is_err());
+        assert!(store.insert_ratings(&[("x".into(), 3)]).is_err());
+        assert!(store.set_favorites_batch(&["x".into()], true).is_err());
         store.upsert_patches(&[]);
-        store.upsert_rating("x", 1, Some(3));
-        let (t, r) = store.load_all();
-        assert!(t.is_empty() && r.is_empty());
+        assert!(store.load_times().is_empty());
+        assert!(store.all_ratings().is_empty());
+        assert!(store.all_favorites().is_empty());
         // 导入日志在降级模式下也要安全
         assert_eq!(store.log_import(&sample_log()), -1);
         assert!(store.recent_imports(5).is_empty());

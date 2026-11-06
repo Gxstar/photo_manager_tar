@@ -1,15 +1,16 @@
 //! 图库模块：媒体库文件列表 + 拍摄时间后台补齐 + 单文件信息。
 //!
-//! 设计要点（docs/开发方案.md §8）：
+//! 设计要点（docs/开发方案.md §8、§10）：
 //! - 列表只 stat 不读内容；拍摄时间在后台线程逐个读（HDD 顺序友好），
 //!   每 200 个经 `gallery-times` 事件推送补丁，全部完成后前端一次性重排。
 //! - 进程内 `time_cache`（path → (mtime, time)），二次进页秒排。
+//! - **评分不在这里**：2026-11-05 起 `ratings` SQLite 表是唯一权威源，
+//!   `gallery_list` 直接读取；本模块不再读写文件内嵌 XMP 评分。
 
 use crate::error::{AppError, AppResult};
 use crate::meta::classify;
 use crate::meta::photo::photo_exif;
 use crate::meta::video::{video_dimensions, video_shoot_time};
-use crate::meta::xmp;
 use crate::models::{AppConfig, FileKind};
 use chrono::NaiveDateTime;
 use std::collections::HashMap;
@@ -29,18 +30,19 @@ pub struct GalleryItem {
     pub size: u64,
     pub mtime_secs: i64,
     pub shoot_time: Option<String>,
-    /// XMP 评分 1-5（仅可评分格式；None = 无评分或不支持）
+    /// 评分 1-5（来自 `ratings` 表；None = 未评分）。与文件格式无关
     pub rating: Option<u8>,
+    /// 收藏（来自 `favorites` 表）；二值、与评分互不派生
+    pub favorite: bool,
 }
 
-/// `gallery-times` 事件的单文件补丁
+/// `gallery-times` 事件的单文件补丁（只补拍摄时间）
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimePatch {
     pub path: String,
     pub mtime_secs: i64,
     pub shoot_time: Option<String>,
-    pub rating: Option<u8>,
 }
 
 /// 时间补齐进度事件（done == total 表示完成，前端收到后一次性重排）
@@ -63,9 +65,6 @@ pub struct GalleryInfo {
     pub lens: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    pub rating: Option<u8>,
-    /// 是否真的存在可写入的内嵌 XMP 评分位（能力探测，供信息栏灰显）
-    pub rating_writable: bool,
     /// 光圈值 f/N
     pub f_number: Option<f64>,
     /// 曝光时间（分子/分母），前端按 num<den 显示 1/N
@@ -84,10 +83,8 @@ pub struct ExposureTime {
     pub den: u32,
 }
 
-/// 类型缓存：path → (mtime, shoot_time)，供 gallery_list 命中复用
+/// 时间缓存：path → (mtime, shoot_time)，供 gallery_list 命中复用
 pub type TimeCache = HashMap<String, (i64, Option<String>)>;
-/// 评分缓存：path → (mtime, rating)。条目存在即「已探测」，(None = 确认无评分)
-pub type RatingCache = HashMap<String, (i64, Option<u8>)>;
 
 /// 后台补齐队列项：cached_time 命中缓存时免于重读
 pub struct PendingItem {
@@ -100,7 +97,7 @@ pub struct PendingItem {
 const TIME_BATCH: usize = 200;
 /// 补齐并发线程数（HDD 多流顺序读，实测吞吐随线程数提升）
 const META_WORKERS: usize = 4;
-/// 文件头扫描长度：EXIF 与 XMP 均在头部，一次读盘同时解析两者（IO 减半）
+/// 文件头扫描长度：EXIF 在头部，一次读盘即可解析拍摄时间
 const HEAD_SCAN: usize = 128 * 1024;
 
 /// 扫描媒体库（原图 + 视频两棵子树），只收 Image/Raw/Video。
@@ -139,6 +136,7 @@ pub fn list_items(cfg: &AppConfig) -> AppResult<Vec<GalleryItem>> {
                 mtime_secs: mtime_secs(&meta),
                 shoot_time: None,
                 rating: None,
+                favorite: false,
             });
         }
     }
@@ -153,14 +151,14 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// pub 供 gallery_set_rating 写入后取新 mtime
+/// pub 供 home.rs 的最近导入列表复用（同一套 mtime 口径）
 pub fn mtime_of(meta: &std::fs::Metadata) -> i64 {
     mtime_secs(meta)
 }
 
-/// 后台补齐元数据（拍摄时间 + JPEG 评分）：4 线程原子领任务，
-/// 每凑满 TIME_BATCH 回调一次（乱序完成，done 以实际完成数计）。
-/// should_stop 在每个任务前检查——用户重新进入图库页时旧任务让位。
+/// 后台补齐拍摄时间：4 线程原子领任务，每凑满 TIME_BATCH 回调一次
+/// （乱序完成，done 以实际完成数计）。should_stop 在每个任务前检查——
+/// 用户重新进入图库页时旧任务让位。
 pub fn fill_meta(
     pending: Vec<PendingItem>,
     on_batch: &(dyn Fn(usize, usize, Vec<TimePatch>) + Send + Sync),
@@ -208,58 +206,40 @@ pub fn fill_meta(
         }
     }
     eprintln!(
-        "[gallery] 元数据补齐完成 {total} 项（{META_WORKERS} 线程），耗时 {:.1}s",
+        "[gallery] 拍摄时间补齐完成 {total} 项（{META_WORKERS} 线程），耗时 {:.1}s",
         started.elapsed().as_secs_f64()
     );
 }
 
-/// 单文件元数据解析。JPEG 一次读头部 128KB，时间与评分共用同一段字节；
-/// 厂商 RAW 只读拍摄时间、不读评分（已明确不支持）；视频 mvhd 走全文件路径。
+/// 单文件拍摄时间解析。JPEG/RAW 一次读头部 128KB（EXIF 在头），
+/// 失败再回退全文件；ISO BMFF（AVIF/HEIC）与视频走全文件路径。
 fn parse_meta(p: &PendingItem) -> TimePatch {
     let path = Path::new(&p.path);
     let mut shoot_time = p.cached_time.clone();
-    let rating;
 
-    match p.kind {
-        FileKind::Video => {
-            if shoot_time.is_none() {
-                shoot_time = read_time(path, p.kind);
-            }
-            rating = None;
-        }
-        FileKind::Image | FileKind::Raw => {
-            // ISO BMFF（AVIF/HEIC）的 EXIF item 与 XMP 都在 mdat 里，且在文件尾部
-            // （实测 AVIF 的 XMP 载荷在 700KB+ 处）→ 读 128KB 头毫无意义，走定点读
-            let bmff = crate::meta::bmff::is_bmff(path);
-            let mut head = if shoot_time.is_none() && !bmff { Some(read_head(path)) } else { None };
-            if shoot_time.is_none() {
-                shoot_time = head
-                    .as_deref()
-                    .and_then(crate::meta::photo::photo_time_from_head)
-                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                    // 头部解析失败 fallback 全文件（个别 EXIF 链超出头部范围）
-                    .or_else(|| read_time(path, p.kind));
-            }
-            // 收窄后只有 JPEG / AVIF·HEIC 会进这里；厂商 RAW 的评分一律为 None
-            rating = if xmp::is_ratable(path) {
-                if bmff {
-                    crate::meta::bmff::rating(path)
+    if shoot_time.is_none() {
+        shoot_time = match p.kind {
+            FileKind::Video => read_time(path, p.kind),
+            FileKind::Image | FileKind::Raw => {
+                if crate::meta::bmff::is_bmff(path) {
+                    // BMFF 的 EXIF item 在 mdat 之后，头部扫描无意义
+                    read_time(path, p.kind)
                 } else {
-                    let h = head.get_or_insert_with(|| read_head(path));
-                    xmp::rating_from_head(h)
+                    let head = read_head(path);
+                    crate::meta::photo::photo_time_from_head(&head)
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        // 头部解析失败 fallback 全文件（个别 EXIF 链超出头部范围）
+                        .or_else(|| read_time(path, p.kind))
                 }
-            } else {
-                None
-            };
-        }
-        _ => rating = None,
+            }
+            _ => None,
+        };
     }
 
     TimePatch {
         path: p.path.clone(),
         mtime_secs: p.mtime_secs,
         shoot_time,
-        rating,
     }
 }
 
@@ -282,14 +262,9 @@ pub fn read_time(path: &Path, kind: FileKind) -> Option<String> {
     Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
-/// 单文件信息（信息栏按需读取，单文件毫秒级）
+/// 单文件信息（信息栏按需读取，单文件毫秒级）。评分不在这里，前端用列表 DTO 的值。
 pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
     let p = PathBuf::from(path);
-    // 评分：按需现读保证权威（BMFF 需要解析 iloc 定点读，不能扫头部）
-    let ratable = xmp::is_ratable(&p);
-    let rating = ratable.then(|| xmp::rating_any(&p)).flatten();
-    // 能力探测：白名单内也可能没有可写的 Rating 位（实测 3 个 AVIF 如此）
-    let rating_writable = ratable && xmp::can_write_rating(&p);
     match kind {
         FileKind::Video => {
             let (w, h) = video_dimensions(&p).unwrap_or((0, 0));
@@ -309,15 +284,13 @@ pub fn info(path: &str, kind: FileKind) -> GalleryInfo {
                 lens: e.lens,
                 width: e.width,
                 height: e.height,
-                rating,
-                rating_writable,
                 f_number: e.f_number,
                 exposure: e.exposure.map(|(num, den)| ExposureTime { num, den }),
                 iso: e.iso,
                 focal_length: e.focal_length,
                 focal_length_35mm: e.focal_length_35mm,
             },
-            None => GalleryInfo { rating, rating_writable, ..GalleryInfo::empty() },
+            None => GalleryInfo::empty(),
         },
         _ => GalleryInfo::empty(),
     }
@@ -332,8 +305,6 @@ impl GalleryInfo {
             lens: None,
             width: None,
             height: None,
-            rating: None,
-            rating_writable: false,
             f_number: None,
             exposure: None,
             iso: None,

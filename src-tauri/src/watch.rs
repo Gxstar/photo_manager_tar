@@ -50,13 +50,20 @@ pub fn spawn(app: &AppHandle) {
 
     let app_h = app.clone();
     std::thread::spawn(move || {
-        // 收到防抖聚合后的事件批次：过滤纯 .tmp 噪音（打分临时文件）后通知
+        // 收到防抖聚合后的事件批次：过滤掉不影响图库的噪音后通知。
+        // .tmp = 原子写临时文件；.xmp/.pp3/.acr = 评分 sidecar 与第三方 sidecar
+        // （sidecar 不进图库列表，批量导出不该触发全量重拉）。
         while let Ok(Ok(events)) = rx.recv() {
             let meaningful = events.iter().any(|e| {
                 e.paths.iter().any(|p| {
                     p.extension()
                         .and_then(|x| x.to_str())
-                        .map(|x| !x.eq_ignore_ascii_case("tmp"))
+                        .map(|x| {
+                            !matches!(
+                                x.to_ascii_lowercase().as_str(),
+                                "tmp" | "xmp" | "pp3" | "acr"
+                            )
+                        })
                         .unwrap_or(true)
                 })
             });

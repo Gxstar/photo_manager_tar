@@ -148,8 +148,9 @@ export function watchGalleryTimes() {
     for (const it of store.gallery.items) {
       const p = map.get(it.path);
       if (!p) continue;
+      // 只补拍摄时间：评分来自 `ratings` 表（gallery_list 已带值），
+      // 时间补丁不再含 rating 字段，写 it.rating 会把评分抹成 undefined
       it.shootTime = p.shootTime;
-      it.rating = p.rating;
     }
     store.gallery.timesDone = done;
     store.gallery.timesTotal = total;

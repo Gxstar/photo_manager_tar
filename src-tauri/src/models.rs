@@ -31,10 +31,9 @@ pub enum TimeSource {
 pub enum FileStatus {
     /// 新增：目标不存在，待拷贝
     New,
-    /// 已存在：卡上快门产物已落库（库内字节数 ≥ 卡上；更小的 JPEG 若尾部完整，
-    /// 即裁剪等编辑缩小，也算）。跳过
+    /// 已存在：同名同月目标存在且字节数与卡上相等，跳过
     Exists,
-    /// 冲突：库内比卡上更小且不是完整 JPEG（多半是进程强杀残留），跳过并报告
+    /// 冲突：同名同月目标存在但字节数不等（强杀残留 / 同名不同内容），跳过并报告
     Conflict,
     /// 改名跳过：库内已有内容相同但改了名的文件
     /// （EXIF 拍摄秒 + 字节数 + 扩展名签名一致），跳过并在 note 里标注库内路径
@@ -244,14 +243,26 @@ pub struct ImportFailure {
     pub reason: String,
 }
 
-/// 批量评分里单个文件的写入失败明细。带 path 是为了让前端只更新成功项，
-/// 不把失败文件误标成已评分（否则「点了星却没写进去」是看不见的脏数据）。
+/// 一次性从文件内嵌 XMP 导入评分的结果（手动触发，回报条数避免静默吞数据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RatingFailure {
-    pub path: String,
-    pub file_name: String,
-    pub reason: String,
+pub struct RatingsImportReport {
+    pub imported: usize,
+    pub skipped_existing: usize,
+    pub no_rating: usize,
+    pub unreadable: usize,
+    pub unreadable_files: Vec<String>,
+}
+
+/// 导出评分到 XMP sidecar 的结果（绝不覆盖第三方 sidecar，跳过项要可见）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarExportReport {
+    pub written: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub skipped_files: Vec<String>,
+    pub failed: Vec<String>,
 }
 
 /// 一次拷贝记录（每次点「开始拷贝」产生一条；取消也记，`cancelled = true`）

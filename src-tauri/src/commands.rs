@@ -5,7 +5,7 @@ use crate::error::{AppError, AppResult};
 use crate::gallery::{self, GalleryInfo, GalleryItem, TimesEvent};
 use crate::models::{
     AppConfig, CopyEvent, CopyPlan, Device, FileKind, HomeOverview, ImportFailure, ImportLog,
-    LibraryStats, RatingFailure, ScanEvent,
+    LibraryStats, RatingsImportReport, ScanEvent, SidecarExportReport,
 };
 use crate::scanner;
 use crate::state::AppState;
@@ -279,8 +279,8 @@ pub fn open_in_explorer(path: String) -> AppResult<()> {
 
 // ── 图库 ─────────────────────────────────────────────────────────────────
 
-/// 图库列表：只 stat 不读内容；命中进程内时间/评分缓存；
-/// 缺失的元数据交给后台任务逐个补齐（gallery-times 事件批量推送）
+/// 图库列表：只 stat 不读内容；评分直接从 `ratings` 表（权威源）读，
+/// 拍摄时间命中进程内缓存，缺失的交给后台任务补齐（gallery-times 批量推送）。
 #[tauri::command]
 pub async fn gallery_list(
     app: AppHandle,
@@ -293,11 +293,19 @@ pub async fn gallery_list(
 
     items.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
 
-    // 命中缓存 → 二次进页直接带元数据返回
+    // 评分与收藏都来自 SQLite（权威源），与文件格式无关
+    {
+        let ratings = state.meta.all_ratings();
+        let favorites = state.meta.all_favorites();
+        for it in items.iter_mut() {
+            it.rating = ratings.get(&it.path).copied();
+            it.favorite = favorites.contains(&it.path);
+        }
+    }
+
     let mut pending: Vec<gallery::PendingItem> = Vec::new();
     {
         let times = state.time_cache.lock().unwrap();
-        let ratings = state.rating_cache.lock().unwrap();
         for it in items.iter_mut() {
             let time_known = match times.get(&it.path) {
                 Some((m, t)) if *m == it.mtime_secs => {
@@ -306,15 +314,7 @@ pub async fn gallery_list(
                 }
                 _ => false,
             };
-            let rating_known = match ratings.get(&it.path) {
-                Some((m, r)) if *m == it.mtime_secs => {
-                    it.rating = *r;
-                    true
-                }
-                _ => false,
-            };
-            let need_rating = crate::meta::xmp::is_ratable(Path::new(&it.path));
-            if !time_known || (need_rating && !rating_known) {
+            if !time_known {
                 pending.push(gallery::PendingItem {
                     path: it.path.clone(),
                     mtime_secs: it.mtime_secs,
@@ -337,15 +337,7 @@ pub async fn gallery_list(
                     cache.insert(p.path.clone(), (p.mtime_secs, p.shoot_time.clone()));
                 }
             }
-            {
-                let mut cache = st.rating_cache.lock().unwrap();
-                for p in &patches {
-                    if crate::meta::xmp::is_ratable(Path::new(&p.path)) {
-                        cache.insert(p.path.clone(), (p.mtime_secs, p.rating));
-                    }
-                }
-            }
-            // SQLite 持久回写（降级模式 no-op）
+            // SQLite 时间缓存回写（降级模式 no-op）
             st.meta.upsert_patches(&patches);
             let _ = app_emit.emit("gallery-times", TimesEvent { done, total, patches });
         };
@@ -374,75 +366,80 @@ pub fn gallery_open(path: String) -> AppResult<()> {
         .map_err(|e| AppError::IoError(e.to_string()))
 }
 
-/// 按容器类型分派写入：
-/// - JPEG：XMP 在 APP1 段，长度可能变 → 整文件重写（tmp + rename）
-/// - AVIF/HEIF（ISO BMFF）：XMP 在 mime item 的载荷里（文件尾部），值恒单字符
-///   → 原地改 1 个字节
-/// 厂商 RAW 不支持评分；调用方已按 is_ratable 过滤，走到这里会明确报错。
-fn write_rating_for(path: &Path, value: u8) -> Result<(), String> {
-    use crate::meta::{bmff, xmp};
-    if xmp::is_jpeg(path) {
-        xmp::write_jpeg_rating(path, value)
-    } else if bmff::is_bmff(path) {
-        bmff::write_rating(path, value)
-    } else {
-        Err("该文件类型不支持评分".to_string())
-    }
-}
-
-/// 批量写入 XMP 评分（仅 JPEG / AVIF·HEIC，均写文件内嵌 XMP；rating=None 表示清除）。
-/// 返回失败明细（路径 + 文件名 + 原因），空 = 全部成功；
-/// 前端据此只更新真正写成功的文件，避免不可写文件被误标成已评分。
+/// 批量打分 / 清除评分：**只写 SQLite `ratings` 表，绝不改图片文件**。
+/// rating=None 或 0 = 清除（删行）；DB 不可用 / 写失败一律报错（硬规则 #14），
+/// 不允许降级静默成功——那等于悄悄丢分。
 #[tauri::command]
-pub async fn gallery_set_rating(
+pub fn gallery_set_rating(
     paths: Vec<String>,
     rating: Option<u8>,
-    app: AppHandle,
-) -> AppResult<Vec<RatingFailure>> {
-    let value = rating.unwrap_or(0);
-    if value > 5 {
-        return Err(AppError::IoError("评分超出 1-5 范围".into()));
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    if let Some(v) = rating {
+        if v > 5 {
+            return Err(AppError::IoError("评分超出 1-5 范围".into()));
+        }
     }
-    let results = tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|p| {
-                let path = Path::new(&p);
-                let r = write_rating_for(path, value).and_then(|_| {
-                    std::fs::metadata(path)
-                        .map(|m| gallery::mtime_of(&m))
-                        .map_err(|e| e.to_string())
-                });
-                (p, r)
-            })
-            .collect::<Vec<_>>()
+    if !state.meta.is_available() {
+        return Err(AppError::IoError("评分数据库不可用，评分未保存".into()));
+    }
+    let value = rating.filter(|v| *v > 0);
+    state.meta.set_ratings_batch(&paths, value).map_err(AppError::IoError)
+}
+
+/// 批量收藏 / 取消收藏：**只写 SQLite `favorites` 表，绝不改图片文件**。
+/// DB 不可用或写失败一律报错（硬规则 #14），不允许降级静默成功。
+#[tauri::command]
+pub fn gallery_set_favorite(
+    paths: Vec<String>,
+    favorite: bool,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    if !state.meta.is_available() {
+        return Err(AppError::IoError("评分数据库不可用，收藏未保存".into()));
+    }
+    state
+        .meta
+        .set_favorites_batch(&paths, favorite)
+        .map_err(AppError::IoError)
+}
+
+/// 设置页展示：评分数据库文件路径（备份要复制的就是它）
+#[tauri::command]
+pub fn ratings_db_path(state: State<'_, AppState>) -> String {
+    state.meta.db_location()
+}
+
+/// 一次性迁移：从文件内嵌 XMP 读回旧评分（**只读文件**，只插不覆盖 DB 已有值）。
+/// 手动触发并回报条数，不猜真库现状。
+#[tauri::command]
+pub async fn ratings_import_from_files(
+    state: State<'_, AppState>,
+) -> AppResult<RatingsImportReport> {
+    let cfg = state.config.lock().unwrap().clone();
+    let items = tauri::async_runtime::spawn_blocking(move || gallery::list_items(&cfg))
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))??;
+    let existing = state.meta.all_ratings();
+    let (entries, mut report) = tauri::async_runtime::spawn_blocking(move || {
+        crate::meta::sidecar::import_from_files(&items, &existing)
     })
     .await
     .map_err(|e| AppError::IoError(e.to_string()))?;
+    report.imported = state
+        .meta
+        .insert_ratings(&entries)
+        .map_err(AppError::IoError)?;
+    Ok(report)
+}
 
-    let st = app.state::<AppState>();
-    let mut failed = Vec::new();
-    {
-        let mut cache = st.rating_cache.lock().unwrap();
-        for (p, r) in results {
-            match r {
-                Ok(mtime) => {
-                    cache.insert(p.clone(), (mtime, (value > 0).then_some(value)));
-                    // SQLite 持久回写
-                    st.meta.upsert_rating(&p, mtime, (value > 0).then_some(value));
-                }
-                Err(reason) => {
-                    failed.push(RatingFailure {
-                        file_name: Path::new(&p)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| p.clone()),
-                        path: p,
-                        reason,
-                    });
-                }
-            }
-        }
-    }
-    Ok(failed)
+/// 手动互操作：把评分导出成 XMP sidecar（默认不执行；绝不覆盖第三方 sidecar）
+#[tauri::command]
+pub async fn ratings_export_sidecars(
+    state: State<'_, AppState>,
+) -> AppResult<SidecarExportReport> {
+    let ratings = state.meta.all_ratings();
+    tauri::async_runtime::spawn_blocking(move || crate::meta::sidecar::export(&ratings))
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))
 }

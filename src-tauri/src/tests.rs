@@ -277,11 +277,10 @@ fn renamed_file_in_library_is_skipped() {
     let _ = std::fs::remove_dir_all(&lib);
 }
 
-/// 三态判定（新语义）：判重对象是「快门产物是否已落库」，与库内后续编辑无关。
-/// 库内编辑放大 / 裁剪缩小（尾部完整）→ 已存在；
-/// 残缺半截（强杀残留特征：无 EOI）与非 JPEG 更小 → 冲突。
+/// 判重（2026-11-05 简化后）：库内文件永不修改 → 只看「存在 + 字节数相等」。
+/// 任何字节数不等（放大 / 缩小 / 残缺半截 / 其它格式）一律冲突，不再猜是不是编辑过。
 #[test]
-fn stat_target_recognizes_edited_files() {
+fn stat_target_sizes() {
     let dir = std::env::temp_dir().join(format!("sdi-stat-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -294,19 +293,18 @@ fn stat_target_recognizes_edited_files() {
     use crate::models::FileStatus as FS;
     use crate::scanner::stat_target;
 
-    // 等大 / 库内更大（评分 XMP、编辑放大）→ 已存在
+    // 等大 → 已存在；库内更大 / 更小 → 冲突
     assert_eq!(stat_target(&big, big_len), FS::Exists);
-    assert_eq!(stat_target(&big, small_len), FS::Exists);
-    // 库内更小但 JPEG 尾部完整（裁剪 16:9 场景）→ 已存在
-    assert_eq!(stat_target(&small, big_len), FS::Exists);
+    assert_eq!(stat_target(&big, small_len), FS::Conflict);
+    assert_eq!(stat_target(&small, big_len), FS::Conflict);
 
-    // 残缺半截（截断，无 EOI）→ 冲突（强杀残留兜底）
+    // 残缺半截（强杀残留）→ 冲突
     let truncated = dir.join("truncated.jpg");
     let half = &std::fs::read(&big).unwrap()[..(big_len as usize / 2)];
     std::fs::write(&truncated, half).unwrap();
     assert_eq!(stat_target(&truncated, big_len), FS::Conflict);
 
-    // 非 JPEG 更小（视频/RAW 不会被原地编辑，更小只可能是残留）→ 冲突
+    // 非 JPEG 更小 → 冲突
     let raw = dir.join("P1234567.RW2");
     std::fs::write(&raw, b"small").unwrap();
     assert_eq!(stat_target(&raw, big_len), FS::Conflict);
@@ -509,33 +507,6 @@ fn gallery_full_library_smoke() {
         per_file_ms * items.len() as f64 / 1000.0
     );
     assert!(ok >= 25, "抽样成功率过低：{ok}/30");
-}
-
-/// G-06：评分写入不得改动文件系统的修改时间（mtime）。
-/// 缩略图缓存以 mtime 为 key，mtime 一变整个缓存失效重做；用户看到的
-/// 「修改时间」也会跳到打分时刻。EXIF 拍摄时间本来就不受影响。
-#[test]
-fn rating_write_keeps_mtime() {
-    let dir = std::env::temp_dir().join(format!("sdi-mtime-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let jpg = synth_jpeg(&dir, "rate.jpg", 64, 32);
-
-    // 隔开一点，让「被改成当前时间」这种情况能被断言捕捉到
-    std::thread::sleep(Duration::from_millis(1100));
-    let before = std::fs::metadata(&jpg).unwrap().modified().unwrap();
-
-    crate::meta::xmp::write_jpeg_rating(&jpg, 4).expect("写入评分应成功");
-    assert_eq!(crate::meta::xmp::rating(&jpg), Some(4));
-    let after = std::fs::metadata(&jpg).unwrap().modified().unwrap();
-    assert_eq!(after, before, "打分后 mtime 必须与写入前一致");
-
-    // 清除评分同样要保 mtime
-    crate::meta::xmp::write_jpeg_rating(&jpg, 0).expect("清除评分应成功");
-    assert_eq!(crate::meta::xmp::rating(&jpg), None);
-    let cleared = std::fs::metadata(&jpg).unwrap().modified().unwrap();
-    assert_eq!(cleared, before, "清除评分后 mtime 必须保持不变");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// G-07：侧边栏统计口径必须等于图库项数（原图 + 视频里的 image/raw/video）。

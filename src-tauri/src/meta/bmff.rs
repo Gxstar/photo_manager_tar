@@ -1,20 +1,16 @@
-//! AVIF / HEIC / HEIF（ISO BMFF 容器）的内嵌 XMP 评分。
+//! AVIF / HEIC / HEIF（ISO BMFF 容器）内嵌 XMP 的**只读**解析。
 //!
 //! ISO BMFF 的 XMP 在 `meta → iinf` 里一个 `item_type = "mime"` 的 item，
 //! 数据位置由 iloc 的 extent 给出（**绝对文件偏移 + 长度**），
 //! 实测位于 mdat 之后（文件尾部），距文件头可达数百 KB。
 //! 所以不能「扫文件头找 `<x:xmpmeta`」——必须先解析 iloc 拿到真实偏移再定点读。
 //! 要读的只有 meta（前几百字节）和 XMP 载荷（约 1KB）。
-//! （JPEG 在 APP1 段，见 `xmp.rs`；厂商 RAW 已明确不支持评分。）
 //!
-//! 写：「原地改 1 字节」——xmp:Rating 的值恒为单字符（0-5），
-//! 替换前后长度相同，容器结构、盒子大小、所有 iloc 偏移、像素数据全不受影响。
-//!
-//! 实测（本机 1,398 个 AVIF）：全部有 mime item；1,396 个含
-//! `<xmp:Rating>0</xmp:Rating>`（值恒为单字符）；2 个无 rating 字段；1 个无 mime item。
+//! 2026-11-05 起本模块**不再写入**：评分权威源是 SQLite，保留解析只用于
+//! 「一次性从文件导入旧评分」。文件永远以只读方式打开。
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// 支持 ISO BMFF 内嵌 XMP 的扩展名。
@@ -43,62 +39,6 @@ pub fn rating(path: &Path) -> Option<u8> {
     let (abs, len) = xmp_payload(&mut f)?;
     let payload = read_at(&mut f, abs, len)?;
     super::xmp::parse_rating(&payload)
-}
-
-/// 能力探测：是否真的存在「可原地改写」的单字符 Rating 位。
-/// 与 `write_rating` 的前置条件完全一致（同一套定位逻辑），供信息栏灰显；
-/// 无 mime item、无 rating 字段、值不是单字符都返回 false。
-pub fn can_write_rating(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else { return false };
-    let Some((abs, len)) = xmp_payload(&mut f) else { return false };
-    let Some(payload) = read_at(&mut f, abs, len) else { return false };
-    super::xmp::rating_span(&payload)
-        .is_some_and(|(s, e)| e - s == 1)
-}
-
-/// 原地写入 xmp:Rating：**只改 1 个字节**，文件长度与所有容器偏移不动。
-pub fn write_rating(path: &Path, rating: u8) -> Result<(), String> {
-    // 与 JPEG 同理：改 XMP 不改画面，mtime 不该变（否则缩略图缓存全失效）
-    let orig_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
-
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("打开失败: {e}"))?;
-
-    let (abs, len) = xmp_payload(&mut f)
-        .ok_or_else(|| "未找到内嵌 XMP（AVIF/HEIF 需含 mime 类型的元数据项）".to_string())?;
-    let payload = read_at(&mut f, abs, len).ok_or_else(|| "读取 XMP 载荷失败".to_string())?;
-
-    let (vstart, vend) =
-        super::xmp::rating_span(&payload).ok_or_else(|| "XMP 里没有 xmp:Rating 字段".to_string())?;
-
-    // 0-5 恒为单字符；长度不符（如 "4.5"）就地替换会改变载荷长度、破坏
-    // iloc extent_length → 拒绝，不冒险。
-    if vend - vstart != 1 {
-        return Err(format!(
-            "XMP 评分值为 {} 字节（非 0-5 单字符），不做原地修改以免破坏文件结构",
-            vend - vstart
-        ));
-    }
-    let new_byte = b'0' + rating;
-    if payload[vstart] == new_byte {
-        return Ok(()); // 已是目标值，不产生磁盘写
-    }
-
-    f.seek(SeekFrom::Start(abs + vstart as u64))
-        .map_err(|e| format!("定位失败: {e}"))?;
-    f.write_all(&[new_byte]).map_err(|e| format!("写入失败: {e}"))?;
-    f.flush().map_err(|e| format!("刷盘失败: {e}"))?;
-    drop(f);
-
-    if let Some(t) = orig_mtime {
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-            let _ = f.set_modified(t);
-        }
-    }
-    Ok(())
 }
 
 /// 定位 XMP 载荷：(绝对文件偏移, 长度)。
@@ -385,7 +325,7 @@ mod tests {
 
     /// 每个用例独立的临时目录（用例并行跑，共用目录会互删）
     fn tmp(case: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("bmff_rating_test_{case}"));
+        let dir = std::env::temp_dir().join(format!("bmff_read_test_{case}"));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join(name);
         std::fs::write(&p, bytes).unwrap();
@@ -393,57 +333,28 @@ mod tests {
     }
 
     fn cleanup(case: &str) {
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("bmff_rating_test_{case}")));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("bmff_read_test_{case}")));
     }
 
     #[test]
-    fn reads_and_updates_rating() {
-        let p = tmp("read", "a.avif", &build_avif(XMP));
-        assert!(can_write_rating(&p), "含单字符 Rating 的 AVIF 应可写");
-        assert_eq!(rating(&p), None, "0 = 未评分");
-        write_rating(&p, 4).unwrap();
+    fn reads_embedded_rating_without_writing() {
+        let with4 = XMP.replace("<xmp:Rating>0</xmp:Rating>", "<xmp:Rating>4</xmp:Rating>");
+        let bytes = build_avif(&with4);
+        let p = tmp("read", "a.avif", &bytes);
         assert_eq!(rating(&p), Some(4));
-        write_rating(&p, 0).unwrap();
-        assert_eq!(rating(&p), None, "写 0 = 清除评分");
+        assert_eq!(std::fs::read(&p).unwrap(), bytes, "读取绝不能改文件");
+
+        let p0 = tmp("read", "zero.avif", &build_avif(XMP));
+        assert_eq!(rating(&p0), None, "0 = 未评分");
         cleanup("read");
     }
 
     #[test]
-    fn write_changes_exactly_one_byte() {
-        let before = build_avif(XMP);
-        let p = tmp("onebyte", "b.avif", &before);
-        let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
-
-        write_rating(&p, 5).unwrap();
-
-        let after = std::fs::read(&p).unwrap();
-        assert_eq!(after.len(), before.len(), "文件长度必须不变");
-        let diff: Vec<usize> = before
-            .iter()
-            .zip(after.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(diff.len(), 1, "只应有 1 个字节变化");
-        assert_eq!(before[diff[0]], b'0');
-        assert_eq!(after[diff[0]], b'5');
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().modified().unwrap(),
-            mtime_before,
-            "mtime 必须还原（否则缩略图缓存全失效）"
-        );
-        cleanup("onebyte");
-    }
-
-    #[test]
-    fn missing_mime_item_is_rejected() {
+    fn missing_mime_item_returns_none() {
         let mut data = bx(b"ftyp", b"avif\0\0\0\0mif1avif");
         data.extend(bx(b"mdat", b"nothing here"));
         let p = tmp("nomime", "c.avif", &data);
         assert_eq!(rating(&p), None);
-        assert!(!can_write_rating(&p), "无 mime item 应被能力探测判为不可写");
-        assert!(write_rating(&p, 3).is_err(), "无 mime item 应明确报错");
         cleanup("nomime");
     }
 
@@ -453,55 +364,5 @@ mod tests {
         assert!(is_bmff(Path::new("b.heic")));
         assert!(!is_bmff(Path::new("c.jpg")));
         assert!(!is_bmff(Path::new("d.rw2")));
-    }
-}
-
-/// 真实文件冒烟检查（默认忽略）：
-///   WB_AVIF="C:\path\copy.avif" cargo test real_avif_smoke -- --ignored --nocapture
-/// 用**副本**跑，检查「只改 1 字节 / 长度不变 / mtime 不变 / 评分能读回」。
-#[cfg(test)]
-mod real_check {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn real_avif_smoke() {
-        let path = std::env::var("WB_AVIF").expect("需要 WB_AVIF 指向一个 AVIF 副本");
-        let p = Path::new(&path);
-        let m0 = std::fs::metadata(p).unwrap();
-        let before = std::fs::read(p).unwrap();
-        let r0 = rating(p);
-        println!("写入前: {} 字节, 评分 {:?}", before.len(), r0);
-
-        write_rating(p, 4).unwrap();
-        let after = std::fs::read(p).unwrap();
-        let m1 = std::fs::metadata(p).unwrap();
-
-        let diff: Vec<usize> = before
-            .iter()
-            .zip(after.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, _)| i)
-            .collect();
-        println!("写入后: 评分 {:?}", rating(p));
-        println!("差异字节数 {}, 位置 {:?}", diff.len(), diff);
-        for &i in &diff {
-            println!("  @{i}: {} -> {}", before[i] as char, after[i] as char);
-        }
-        println!(
-            "长度 {} -> {}（不变={}）",
-            before.len(),
-            after.len(),
-            before.len() == after.len()
-        );
-        println!(
-            "mtime 不变={}",
-            m0.modified().unwrap() == m1.modified().unwrap()
-        );
-        assert_eq!(rating(p), Some(4));
-        assert_eq!(diff.len(), 1);
-        assert_eq!(before.len(), after.len());
-        assert_eq!(m0.modified().unwrap(), m1.modified().unwrap());
     }
 }

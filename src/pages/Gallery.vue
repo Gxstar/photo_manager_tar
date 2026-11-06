@@ -7,9 +7,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   Aperture,
+  Check,
+  ChevronDown,
   Film,
   FileImage,
   FolderOpen,
+  Heart,
   Images,
   LayoutGrid,
   LoaderCircle,
@@ -18,26 +21,92 @@ import {
 } from "lucide-vue-next";
 import { store, loadGallery, watchGalleryTimes, watchGalleryChanged, formatBytes, errMsg } from "../store.js";
 
-// ── 几何常量 ─────────────────────────────────────────────────────────────
-const CELL_MIN = 148; // 单元格最小宽（据此算列数）
-const THUMB_H = 116; // 缩略图区高
-const LABEL_H = 24; // 文件名行高
-const ROW_H = THUMB_H + LABEL_H; // 行内容高
+// ── 缩略图尺寸档位（对标资源管理器「查看」菜单）──────────────────────────
+// 用户选的是缩略图大小，列数由容器宽度自动算出。格宽与缩略图高按 ~1.28
+// 等比联动 → 切档只是整体缩放，object-cover 的裁切比例不变。
+// 最大档受后端 Shell 缩略图 256px 边长限制（thumbs.rs THUMB_SIZE）：164 CSS px
+// 在 150% DPI 下约 246 物理像素仍够用，再大就会被拉伸变糊。
+// 离散档位是刚性要求：行级虚拟化必须预先知道行高，自由滑块会让它每帧重测。
+const DENSITIES = [
+  { id: "small", label: "小", cell: 104, thumb: 78, icon: 12 },
+  { id: "standard", label: "标准", cell: 148, thumb: 116, icon: 15 },
+  { id: "large", label: "大", cell: 208, thumb: 164, icon: 18 },
+];
+const DENSITY_KEY = "develop.gallery.density";
 const GAP = 10; // 单元间距
+const LABEL_H = 24; // 文件名行高（不随档位变，字号固定 12px）
 const HEADER_H = 40; // 分组表头行高
 
 // ── 布局 ─────────────────────────────────────────────────────────────────
 const scrollEl = ref(null);
 const contentEl = ref(null);
 const cols = ref(4);
-const cellW = ref(CELL_MIN);
+const cellW = ref(DENSITIES[1].cell);
 let ro = null;
+
+function readDensity() {
+  try {
+    const id = localStorage.getItem(DENSITY_KEY);
+    const i = DENSITIES.findIndex((d) => d.id === id);
+    if (i >= 0) return i;
+  } catch {
+    // localStorage 被禁用时静默回落默认档
+  }
+  return 1; // 标准 = 原固定值 148 / 116
+}
+const densityIdx = ref(readDensity());
+const density = computed(() => DENSITIES[densityIdx.value]);
+const cellMin = computed(() => density.value.cell);
+const thumbH = computed(() => density.value.thumb);
+const rowH = computed(() => thumbH.value + LABEL_H); // 行内容高
 
 function measure() {
   const w = contentEl.value?.clientWidth ?? 0;
   if (w <= 0) return;
-  cols.value = Math.max(2, Math.floor((w + GAP) / (CELL_MIN + GAP)));
+  cols.value = Math.max(2, Math.floor((w + GAP) / (cellMin.value + GAP)));
   cellW.value = (w - (cols.value - 1) * GAP) / cols.value;
+  scheduleSticky(); // 宽度变了行可能重排，下一帧重算吸顶组
+}
+
+// ── 「查看」下拉菜单 ──────────────────────────────────────────────────────
+// 菜单 Teleport 到 body + fixed 定位：不依赖祖先容器的 overflow，工具条换行后坐标仍按按钮 rect 算
+const viewMenuOpen = ref(false);
+const viewBtn = ref(null);
+const menuPos = ref({ top: 0, left: 0 });
+const MENU_W = 144;
+
+function toggleViewMenu() {
+  if (viewMenuOpen.value) {
+    viewMenuOpen.value = false;
+    return;
+  }
+  const r = viewBtn.value?.getBoundingClientRect();
+  if (!r) return;
+  menuPos.value = {
+    top: r.bottom + 6,
+    left: Math.max(8, Math.min(r.right - MENU_W, window.innerWidth - MENU_W - 8)),
+  };
+  viewMenuOpen.value = true;
+}
+
+function setDensity(i) {
+  viewMenuOpen.value = false;
+  if (i === densityIdx.value) return;
+  densityIdx.value = i;
+  try {
+    localStorage.setItem(DENSITY_KEY, DENSITIES[i].id);
+  } catch {
+    // 存不了不影响本次会话的使用
+  }
+}
+
+function onGlobalPointerDown(e) {
+  if (viewMenuOpen.value && !e.target.closest("[data-view-menu]")) viewMenuOpen.value = false;
+}
+
+// 窗口尺寸变了，fixed 菜单的坐标会失准，直接收起最简单
+function onWindowResize() {
+  viewMenuOpen.value = false;
 }
 
 // ── 类型筛选 ─────────────────────────────────────────────────────────────
@@ -50,9 +119,17 @@ const filterOpts = [
   { value: "video", label: "视频", icon: Film },
 ];
 
+// ── 星级色阶 ─────────────────────────────────────────────────────────────
+// 1★→5★：砖红 → 赭橙 → 琥珀金 → 橄榄 → 柔绿，五级等明度（色值在 tokens.css :root）。
+// 每颗星按「组内位置」取色：评分 N 时点亮 1..N，最右那颗的颜色即代表评分等级。
+// 角标星形用等级色、数字用白色；信息栏文字用中性墨色 —— 颜色只承载图形语义，
+// 不承载小字号文字，保证 WCAG 文字对比度。未点亮星用 --star-off（白底 3.64:1）。
+const STAR_COLORS = [1, 2, 3, 4, 5].map((n) => `var(--star-${n})`);
+const starColor = (n) => STAR_COLORS[Math.max(1, Math.min(5, n)) - 1];
+const starStyle = (n, lit) => ({ color: lit ? starColor(n) : "var(--star-off)" });
+
 // ── 评分筛选 ─────────────────────────────────────────────────────────────
-// 只对「可评分文件」生效（JPG / AVIF·HEIC）：选「未评」时不把视频、RAW 等项
-// 混进来，否则几千个不可打分文件会把空档淹没。
+// 2026-11-05 起评分存 SQLite，与文件格式无关：RAW / 视频 / DNG 同样可评分。
 // 取值：all 不限 / unrated 未评 / "1".."5" = ≥N★（含 N 星，与 Lightroom 口径一致）
 const ratingFilter = ref("all");
 
@@ -69,11 +146,14 @@ function setMinStars(n) {
 const hoverStars = ref(0);
 const starPreview = computed(() => hoverStars.value || minStars.value);
 
-// 可评分格式（用户决策 2026-11-05）：JPG + ISO BMFF 图片，评分都写文件内嵌 XMP。
-// 厂商 RAW 一律不参与——库内非 RAW 图片的 99.9% 是 JPG + AVIF，不值得为其承担
-// 厂商私有 IFD 偏移的风险。与后端 xmp::is_ratable() 保持一致。
-const RATABLE_EXTS = ["jpg", "jpeg", "avif", "heic", "heif"];
-const isRatable = (item) => RATABLE_EXTS.includes(item.ext);
+// 评分存 SQLite，与格式无关：不再有「可评分白名单」，筛选 / 打分 / 批量
+// 三条路径共用同一份 displayItems。
+
+// ── 收藏筛选（二值 toggle，与类型 / 评分筛选 AND 叠加）──────────────────
+const favoriteFilter = ref(false);
+const favoriteCount = computed(
+  () => store.gallery.items.filter((it) => it.favorite).length,
+);
 
 const kindCounts = computed(() => {
   // 不含 all：总数已在工具条左侧「N 项」，「全部」按钮不重复展示
@@ -85,27 +165,31 @@ const kindCounts = computed(() => {
 const displayItems = computed(() => {
   const kind = kindFilter.value;
   const rating = ratingFilter.value;
-  if (kind === "all" && rating === "all") return store.gallery.items;
+  const fav = favoriteFilter.value;
+  if (kind === "all" && rating === "all" && !fav) return store.gallery.items;
   return store.gallery.items.filter((it) => {
+    if (fav && !it.favorite) return false;
     if (kind !== "all" && it.kind !== kind) return false;
     if (rating === "all") return true;
-    if (!isRatable(it)) return false;
     const r = it.rating ?? 0;
     if (rating === "unrated") return r === 0;
     return r >= Number(rating);
   });
 });
 
-// 评分筛选出空结果时给出真实原因：三种空法（类型里没有可评分文件 /
-// 还没人打高分 / 全都打过）用户看到的都是空网格，文案必须区分，
-// 否则「≥3★ 为空」会被误读成「评分功能坏了」
+// 筛选为空时给出真实原因，否则「≥3★ 为空」会被误读成「功能坏了」
 const emptyHint = computed(() => {
+  if (favoriteFilter.value) {
+    return favoriteCount.value
+      ? "当前筛选下没有已收藏的文件"
+      : "还没有收藏任何文件，选中后按空格即可收藏";
+  }
   if (ratingFilter.value === "all") return null;
   const kind = kindFilter.value;
   const pool =
     kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
-  if (!pool.some(isRatable)) return "评分筛选只对 JPG / AVIF·HEIC 生效，当前类型下没有可评分的文件";
-  if (ratingFilter.value === "unrated") return "可评分的照片都已经打过分了";
+  if (!pool.length) return "当前类型下没有文件";
+  if (ratingFilter.value === "unrated") return "当前视图里的文件都已经打过分了";
   return `还没有 ≥${minStars.value}★ 的照片，选中后按 0-5 即可打分`;
 });
 
@@ -117,7 +201,7 @@ function resetSelection() {
   hoverRating.value = 0;
   hoverStars.value = 0;
 }
-watch([kindFilter, ratingFilter], resetSelection);
+watch([kindFilter, ratingFilter, favoriteFilter], resetSelection);
 
 // 评分写入后目标可能立刻不满足筛选（例如在「≥3★」视图里降到 2★），
 // 把已不在列表里的路径从选择集剔除，避免信息栏出现「选中 1 项」但看不到任何选中态
@@ -183,7 +267,7 @@ const rowVirtualizer = useVirtualizer(
   computed(() => ({
     count: rows.value.length,
     getScrollElement: () => scrollEl.value,
-    estimateSize: (i) => (rows.value[i]?.type === "header" ? HEADER_H : ROW_H + GAP),
+    estimateSize: (i) => (rows.value[i]?.type === "header" ? HEADER_H : rowH.value + GAP),
     getItemKey: (i) => rows.value[i]?.key ?? `i-${i}`,
     measureElement: (el) => el?.getBoundingClientRect().height ?? 0,
     overscan: 4,
@@ -199,6 +283,17 @@ function setRowRef(el) {
 watch(rows, async () => {
   await nextTick();
   rowVirtualizer.value?.measure();
+  scheduleSticky();
+});
+
+// 切档：容器宽度没变 → ResizeObserver 不触发，必须主动重算 cols；
+// 行高也变了，且窄窗口下 cols 可能恰好不变（rows 引用不变、上面的 watch 不触发），
+// 所以要显式清一次虚拟器尺寸缓存，否则残留旧行高会导致行错位。
+watch(densityIdx, async () => {
+  measure();
+  await nextTick();
+  rowVirtualizer.value?.measure();
+  scheduleSticky();
 });
 
 function rowAt(i) {
@@ -210,7 +305,7 @@ const rowOffsets = computed(() => {
   const out = new Array(rows.value.length + 1);
   out[0] = 0;
   for (let i = 0; i < rows.value.length; i++) {
-    out[i + 1] = out[i] + (rows.value[i].type === "header" ? HEADER_H : ROW_H + GAP);
+    out[i + 1] = out[i] + (rows.value[i].type === "header" ? HEADER_H : rowH.value + GAP);
   }
   return out;
 });
@@ -225,6 +320,70 @@ function rowAtY(y) {
     else hi = mid - 1;
   }
   return lo;
+}
+
+// ── 分组表头吸顶 ──────────────────────────────────────────────────────────
+// 虚拟器只保留可视区 ±4 行，月份表头滚过即被卸载；且表头是
+// absolute + translateY 的行，直接给行加 CSS sticky 无效。所以走「旁路浮层」：
+//   · 浮层挂在「不滚动」的包装层上（absolute top-0），与滚动容器平级 →
+//     contentEl 位置、虚拟器坐标、框选坐标系一律不变，且紧贴工具条
+//   · 不用 sticky：滚动容器有 pt-4，sticky 贴的是内容区起点，那条 16px
+//     会漏出上一行照片；sticky 粘附范围还受 containing block 限制
+//   · 当前月份由 scrollTop 在 headerRows 上二分得出；下一组表头距顶
+//     小于 HEADER_H 时把浮层向上推走，形成「被下一个月份替换」的交接
+const headerRows = computed(() => {
+  const offs = rowOffsets.value;
+  const out = [];
+  for (let i = 0; i < rows.value.length; i++) {
+    const r = rows.value[i];
+    if (r.type === "header") out.push({ top: offs[i], label: r.label, count: r.count });
+  }
+  return out;
+});
+
+const stickyHeader = ref(null); // { label, count } | null
+const stickyShift = ref(0); // 负值 = 正被下一组表头顶出视口
+let stickyRaf = 0;
+
+function updateSticky() {
+  stickyRaf = 0;
+  const el = scrollEl.value;
+  const hs = headerRows.value;
+  if (!el || !contentEl.value || !hs.length) {
+    stickyHeader.value = null;
+    stickyShift.value = 0;
+    return;
+  }
+  // 表头 i 距滚动区可视顶 = (contentEl.top - scrollEl.top) + rowOffsets[i]
+  const base = contentEl.value.getBoundingClientRect().top - el.getBoundingClientRect().top;
+  let lo = 0;
+  let hi = hs.length - 1;
+  let cur = -1; // 最后一个已滚过顶的表头
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (hs[mid].top + base <= 0) {
+      cur = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  if (cur < 0) {
+    // 首组表头还在原位，交给真实表头行显示，避免同一月份出现两份
+    stickyHeader.value = null;
+    stickyShift.value = 0;
+    return;
+  }
+  const h = hs[cur];
+  // 只有换月份才更新文本，滚动过程中不制造无谓渲染
+  if (stickyHeader.value?.label !== h.label || stickyHeader.value?.count !== h.count) {
+    stickyHeader.value = { label: h.label, count: h.count };
+  }
+  const nextTop = cur + 1 < hs.length ? hs[cur + 1].top + base : Infinity;
+  stickyShift.value = nextTop >= HEADER_H ? 0 : Math.max(-HEADER_H, nextTop - HEADER_H);
+}
+
+// 滚动高频触发，合并到一帧；行模型 / 档位 / 容器宽度变化也复用同一入口
+function scheduleSticky() {
+  if (!stickyRaf) stickyRaf = requestAnimationFrame(updateSticky);
 }
 
 // ── 加载 ─────────────────────────────────────────────────────────────────
@@ -247,11 +406,16 @@ onMounted(() => {
   watchGalleryTimes();
   watchGalleryChanged();
   window.addEventListener("keydown", onKeydown);
+  window.addEventListener("pointerdown", onGlobalPointerDown);
+  window.addEventListener("resize", onWindowResize);
   load();
 });
 onBeforeUnmount(() => {
   ro?.disconnect();
+  if (stickyRaf) cancelAnimationFrame(stickyRaf);
   window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("pointerdown", onGlobalPointerDown);
+  window.removeEventListener("resize", onWindowResize);
 });
 
 // ── 缩略图 ───────────────────────────────────────────────────────────────
@@ -361,7 +525,7 @@ function onBandMove(e) {
     for (let c = c0; c <= c1 && c < r.items.length; c++) {
       const cx = c * cw;
       // 单元矩形与框相交
-      if (cx < band.value.x2 && cx + cellW.value > band.value.x1 && ry < band.value.y2 && ry + ROW_H > band.value.y1) {
+      if (cx < band.value.x2 && cx + cellW.value > band.value.x1 && ry < band.value.y2 && ry + rowH.value > band.value.y1) {
         next.add(r.items[c].path);
       }
     }
@@ -407,12 +571,15 @@ const indexRow = computed(() => {
 function ensureVisible(idx) {
   const ri = indexRow.value[idx];
   if (ri == null || !contentEl.value || !scrollEl.value) return;
-  const h = ROW_H + GAP;
+  const h = rowH.value + GAP;
   const cellTop = contentEl.value.getBoundingClientRect().top + rowOffsets.value[ri];
   const view = scrollEl.value.getBoundingClientRect();
   const pad = 8;
-  if (cellTop < view.top + pad) {
-    scrollEl.value.scrollTop -= view.top + pad - cellTop;
+  // 分组表头吸顶会遮住顶部 40px：键盘滚到第一行时留出这条高度，
+  // 否则 ↑ / Home 会「选中一个看不见的格子」
+  const padTop = headerRows.value.length ? HEADER_H + pad : pad;
+  if (cellTop < view.top + padTop) {
+    scrollEl.value.scrollTop -= view.top + padTop - cellTop;
   } else if (cellTop + h > view.bottom) {
     scrollEl.value.scrollTop += cellTop + h - view.bottom + pad;
   }
@@ -464,8 +631,11 @@ function onKeydown(e) {
   const tag = (el?.tagName ?? "").toLowerCase();
   // 输入框/可编辑区域不抢键
   if (tag === "input" || tag === "textarea" || el?.isContentEditable) return;
-  // 聚焦在按钮上时把 Enter / 空格留给按钮本身（刷新、筛选等）
-  if (tag === "button" && (e.key === "Enter" || e.key === " ")) return;
+  // 空格无条件归收藏（用户拍板）；按钮仍可用 Enter 激活。
+  // 焦点在按钮上时也不让位，空格分支会 preventDefault 阻止按钮被重复激活。
+  if (tag === "button" && e.key === "Enter") return;
+  // 「查看」菜单打开时网格快捷键先让位（Esc 除外，下面用它收菜单）
+  if (viewMenuOpen.value && e.key !== "Escape") return;
 
   if (e.ctrlKey || e.metaKey) {
     if (e.key.toLowerCase() === "a") {
@@ -481,6 +651,13 @@ function onKeydown(e) {
 
   const n = displayItems.value.length;
   if (!n) return;
+
+  // 空格独占收藏切换：无条件 preventDefault（否则会滚动页面 / 激活焦点按钮）
+  if (e.key === " " || e.code === "Space") {
+    e.preventDefault();
+    onToggleFavorite();
+    return;
+  }
 
   switch (e.key) {
     case "ArrowRight":
@@ -516,6 +693,10 @@ function onKeydown(e) {
       return;
     }
     case "Escape":
+      if (viewMenuOpen.value) {
+        viewMenuOpen.value = false;
+        return;
+      }
       selected.value = new Set();
       anchorIdx.value = -1;
       cursorIdx.value = -1;
@@ -549,6 +730,7 @@ function openItem(item) {
 // ── 信息栏 ───────────────────────────────────────────────────────────────
 // 评分错误提示要在「切换选中」时清空，故声明提前到信息栏 watch 之前
 const ratingError = ref(null);
+const favError = ref(null);
 const info = ref(null);
 const infoLoading = ref(false);
 let infoReq = 0;
@@ -557,6 +739,7 @@ watch(singleItem, async (item) => {
   info.value = null;
   // 切换选中时清掉上一次的写入失败提示，否则会挂在新文件信息栏里张冠李戴
   ratingError.value = null;
+  favError.value = null;
   if (!item) return;
   const req = ++infoReq;
   infoLoading.value = true;
@@ -570,13 +753,9 @@ watch(singleItem, async (item) => {
   }
 });
 
-// ── 评分（XMP xmp:Rating，仅 JPG / AVIF·HEIC 写文件内嵌 XMP）──────────────
+// ── 评分（只写 SQLite ratings 表，绝不改图片文件）─────────────────────────
 const hoverRating = ref(0);
 const ratingBusy = ref(false);
-
-// 能力探测：白名单内也可能没有可写的 Rating 位（实测 3 个 AVIF 如此）。
-// info 还在加载时先当可写，避免加载中闪一下灰态。
-const ratingWritable = computed(() => info.value?.ratingWritable ?? true);
 
 // path → item（多选打分时避免 N×N 查找；Ctrl+A 全选后这是刚性需求）
 const itemByPath = computed(() => {
@@ -585,43 +764,28 @@ const itemByPath = computed(() => {
   return m;
 });
 
-// 当前可评分目标：单选 = 该文件；多选 = 选中项里的 JPG / AVIF·HEIC
+// 当前打分目标：全部选中的媒体文件（评分与文件格式无关）
 const rateTargets = computed(() => {
   if (!selected.value.size) return [];
   const map = itemByPath.value;
   const out = [];
   for (const p of selected.value) {
-    const it = map.get(p);
-    if (it && isRatable(it)) out.push(p);
+    if (map.has(p)) out.push(p);
   }
   return out;
 });
 
-// 信息栏当前显示的评分：info 现读值优先（能感知外部工具改动），回落到列表值
-const curRating = computed(() => {
-  const fromInfo = info.value?.rating;
-  if (fromInfo != null) return fromInfo;
-  return singleItem.value?.rating ?? 0;
-});
+// 信息栏当前显示的评分（列表 DTO 即权威值）
+const curRating = computed(() => singleItem.value?.rating ?? 0);
 
 async function onRate(i) {
   const targets = rateTargets.value;
   if (!targets.length || ratingBusy.value) return;
-  // 单选时能力探测已知不可写：直接说明，不发 IPC（键盘 0-5 也走这里）
-  if (
-    targets.length === 1 &&
-    singleItem.value &&
-    targets[0] === singleItem.value.path &&
-    !ratingWritable.value
-  ) {
-    ratingError.value = "此文件没有可写入的内嵌 XMP 评分位";
-    return;
-  }
   // 单选：再点当前星 = 清除；多选：直接设为该值
   const value = targets.length === 1 && curRating.value === i ? null : i;
-  // 大批量（Ctrl+A 后误操作）二次确认：每张都要整体重写文件，代价不低
+  // 大批量（Ctrl+A 后误操作）二次确认
   if (targets.length > 50) {
-    const ok = await ask(`将给 ${targets.length} 张照片写入评分，继续？`, {
+    const ok = await ask(`将给 ${targets.length} 个文件写入评分（不修改照片文件），继续？`, {
       title: "批量评分",
       kind: "warning",
       okLabel: "继续",
@@ -632,31 +796,55 @@ async function onRate(i) {
   ratingBusy.value = true;
   ratingError.value = null;
   try {
-    const failed = await invoke("gallery_set_rating", { paths: targets, rating: value });
+    await invoke("gallery_set_rating", { paths: targets, rating: value });
     const v = value ?? 0;
-    // 后端现在返回「路径 + 文件名 + 原因」：只给真正写成功的文件更新角标，
-    // 否则点了星却没写进去的文件会被误标成已评分。
-    const failedPaths = new Set((failed ?? []).map((f) => f.path));
     const set = new Set(targets);
     for (const it of store.gallery.items) {
-      if (set.has(it.path) && !failedPaths.has(it.path)) it.rating = v > 0 ? v : null;
-    }
-    if (
-      info.value &&
-      singleItem.value &&
-      set.has(singleItem.value.path) &&
-      !failedPaths.has(singleItem.value.path)
-    ) {
-      info.value.rating = value;
-    }
-    if (failed?.length) {
-      ratingError.value = `${failed.length} 个文件写入失败：${failed[0].fileName}: ${failed[0].reason}${failed.length > 1 ? " 等" : ""}`;
+      if (set.has(it.path)) it.rating = v > 0 ? v : null;
     }
   } catch (e) {
+    // DB 写失败后端会明确报错，这里如实显示，绝不假装已保存
     ratingError.value = errMsg(e);
   } finally {
     ratingBusy.value = false;
   }
+}
+
+// ── 收藏（只写 SQLite favorites 表，绝不改图片文件）──────────────────────
+const favBusy = ref(false);
+const allSelectedFav = computed(
+  () =>
+    rateTargets.value.length > 0 &&
+    rateTargets.value.every((p) => itemByPath.value.get(p)?.favorite),
+);
+
+// 单选 toggle；多选：选区全部已收藏 → 全部取消，否则 → 全部收藏。
+// 不逐个 toggle，避免混合选区敲一次空格后状态更乱。
+async function onToggleFavorite(overridePaths = null) {
+  const targets = overridePaths ?? rateTargets.value;
+  if (!targets.length || favBusy.value) return;
+  const allFav = targets.every((p) => itemByPath.value.get(p)?.favorite);
+  const value = !allFav;
+  favBusy.value = true;
+  favError.value = null;
+  try {
+    await invoke("gallery_set_favorite", { paths: targets, favorite: value });
+    const set = new Set(targets);
+    for (const it of store.gallery.items) {
+      if (set.has(it.path)) it.favorite = value;
+    }
+  } catch (e) {
+    // DB 写失败后端会明确报错，如实显示，不假装已保存
+    favError.value = errMsg(e);
+  } finally {
+    favBusy.value = false;
+  }
+}
+
+// 缩略图红心：单击切换这一张（不依赖当前选区）
+function onHeartClick(item, e) {
+  e.stopPropagation();
+  onToggleFavorite([item.path]);
 }
 
 // ── 展示辅助 ─────────────────────────────────────────────────────────────
@@ -740,91 +928,148 @@ function relDir(item) {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0">
-    <!-- 网格区 -->
-    <div class="flex min-w-0 flex-1 flex-col">
-      <!-- 工具条 -->
-      <div class="flex h-11 shrink-0 items-center gap-3 overflow-hidden border-b border-line px-6 text-sm">
-        <template v-if="store.gallery.items.length">
-          <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
-          <span v-if="kindFilter !== 'all' || ratingFilter !== 'all'" class="shrink-0 whitespace-nowrap text-xs text-ink-3">
-            / 共 {{ store.gallery.items.length.toLocaleString() }} 项
-          </span>
-          <span class="shrink-0 text-ink-3">·</span>
-          <span class="shrink-0 whitespace-nowrap text-ink-2">{{ formatBytes(totalSize) }}</span>
-          <span v-if="timesProgress" class="flex min-w-0 items-center gap-1.5 truncate text-xs text-ink-2">
-            <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
-            <span class="truncate">正在读取拍摄时间与评分 {{ timesProgress }}（首次较慢）</span>
-          </span>
-        </template>
-        <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
-        <span v-if="openError" class="shrink-0 whitespace-nowrap text-xs text-bad">{{ openError }}</span>
-        <div v-if="store.gallery.items.length" class="ml-auto flex shrink-0 items-center gap-1.5">
-          <div class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5">
+  <div class="grid h-full min-h-0 grid-cols-[minmax(0,1fr)_18rem] grid-rows-[auto_minmax(0,1fr)]">
+    <!-- 全宽工具条：横跨网格区 + 信息栏，不再受网格区宽度限制 -->
+    <div class="col-span-2 flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line px-6 py-1.5 text-sm">
+      <template v-if="store.gallery.items.length">
+        <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
+        <span v-if="kindFilter !== 'all' || ratingFilter !== 'all' || favoriteFilter" class="shrink-0 whitespace-nowrap text-xs text-ink-3">
+          / 共 {{ store.gallery.items.length.toLocaleString() }} 项
+        </span>
+        <span class="shrink-0 text-ink-3">·</span>
+        <span class="shrink-0 whitespace-nowrap text-ink-2">{{ formatBytes(totalSize) }}</span>
+        <span v-if="timesProgress" class="flex min-w-0 items-center gap-1.5 truncate text-xs text-ink-2">
+          <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
+          <span class="truncate">正在读取拍摄时间与评分 {{ timesProgress }}（首次较慢）</span>
+        </span>
+      </template>
+      <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
+      <span v-if="openError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="openError">{{ openError }}</span>
+      <div v-if="store.gallery.items.length" class="ml-auto flex shrink-0 items-center gap-1.5">
+        <div class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5">
+          <button
+            v-for="opt in filterOpts"
+            :key="opt.value"
+            class="flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-xs transition-colors"
+            :class="kindFilter === opt.value ? 'bg-surface text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+            @click="kindFilter = opt.value"
+          >
+            <component :is="opt.icon" class="size-3" />
+            {{ opt.label }}
+            <span v-if="opt.value !== 'all'" class="text-[10px] text-ink-3">{{ (kindCounts[opt.value] ?? 0).toLocaleString() }}</span>
+          </button>
+        </div>
+
+        <span class="h-4 w-px shrink-0 bg-line"></span>
+
+        <!-- 评分筛选：星级阈值（点第 N 颗 = ≥N★），评分覆盖全部媒体格式 -->
+        <div
+          class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
+          :title="minStars ? `显示 ≥${minStars}★ 的文件（再点同一颗星取消）` : '按星级筛选（评分覆盖全部媒体格式）'"
+          @mouseleave="hoverStars = 0"
+        >
+          <button
+            class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
+            :class="ratingFilter === 'all' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+            @click="ratingFilter = 'all'"
+          >
+            不限
+          </button>
+          <!-- 星级阈值：点第 N 颗 = ≥N★（含 N 星），悬停预览 -->
+          <div class="mx-0.5 flex items-center gap-px border-x border-line px-1">
             <button
-              v-for="opt in filterOpts"
-              :key="opt.value"
-              class="flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-xs transition-colors"
-              :class="kindFilter === opt.value ? 'bg-surface text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
-              @click="kindFilter = opt.value"
+              v-for="n in 5"
+              :key="n"
+              class="grid size-[18px] place-items-center rounded transition-colors hover:bg-hover"
+              :title="`≥${n}★`"
+              @mouseenter="hoverStars = n"
+              @click="setMinStars(n)"
             >
-              <component :is="opt.icon" class="size-3" />
-              {{ opt.label }}
-              <span v-if="opt.value !== 'all'" class="text-[10px] text-ink-3">{{ (kindCounts[opt.value] ?? 0).toLocaleString() }}</span>
+              <Star
+                class="size-3 fill-current transition-colors"
+                :style="starStyle(n, n <= starPreview)"
+              />
             </button>
           </div>
+          <button
+            class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
+            :class="ratingFilter === 'unrated' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+            @click="ratingFilter = 'unrated'"
+          >
+            未评
+          </button>
+        </div>
 
-          <span class="h-4 w-px shrink-0 bg-line"></span>
+        <span class="h-4 w-px shrink-0 bg-line"></span>
 
-          <!-- 评分筛选：只筛可评分文件，避免不可打分的视频淹没「未评」 -->
+        <!-- 收藏筛选：与评分筛选紧邻但独立成钮，AND 叠加 -->
+        <button
+          class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs transition-colors"
+          :class="favoriteFilter ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:bg-hover'"
+          :title="favoriteFilter ? '只看收藏（再点取消）' : '只看已收藏的文件'"
+          :aria-pressed="favoriteFilter"
+          @click="favoriteFilter = !favoriteFilter"
+        >
+          <Heart
+            class="size-3.5"
+            :class="favoriteFilter ? 'fill-current' : ''"
+            :style="favoriteFilter ? { color: 'var(--fav-on)' } : undefined"
+          />
+          <span>收藏</span>
+          <span class="text-[10px] text-ink-3">{{ favoriteCount.toLocaleString() }}</span>
+        </button>
+
+        <!-- 缩略图尺寸：离散 3 档；菜单 Teleport 到 body + fixed，按按钮 rect 定位 -->
+        <div class="relative" data-view-menu>
+          <button
+            ref="viewBtn"
+            class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs text-ink-2 transition-colors hover:bg-hover"
+            :class="{ 'bg-hover text-ink': viewMenuOpen }"
+            :title="`缩略图大小：${density.label}（${density.thumb}px）`"
+            :aria-expanded="viewMenuOpen"
+            @click="toggleViewMenu"
+          >
+            <LayoutGrid class="size-3.5" />
+            <span>{{ density.label }}</span>
+            <ChevronDown class="size-3 transition-transform" :class="{ 'rotate-180': viewMenuOpen }" />
+          </button>
+        </div>
+
+        <Teleport to="body">
           <div
-            class="flex items-center gap-0.5 rounded-lg bg-subtle p-0.5"
-            :title="minStars ? `显示 ≥${minStars}★ 的可评分文件（再点同一颗星取消）` : '按星级筛选（只对可评分的 JPG / AVIF·HEIC 生效）'"
-            @mouseleave="hoverStars = 0"
+            v-if="viewMenuOpen"
+            class="fixed z-50 w-36 rounded-card border border-line bg-surface p-1 shadow-card"
+            :style="{ top: menuPos.top + 'px', left: menuPos.left + 'px' }"
+            data-view-menu
           >
             <button
-              class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
-              :class="ratingFilter === 'all' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
-              @click="ratingFilter = 'all'"
+              v-for="(d, i) in DENSITIES"
+              :key="d.id"
+              class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-hover"
+              :class="i === densityIdx ? 'bg-amber-soft font-medium text-ink' : 'text-ink-2'"
+              @click="setDensity(i)"
             >
-              不限
-            </button>
-            <!-- 星级阈值：点第 N 颗 = ≥N★（含 N 星），悬停预览 -->
-            <div class="mx-0.5 flex items-center gap-px border-x border-line px-1">
-              <button
-                v-for="n in 5"
-                :key="n"
-                class="grid size-[18px] place-items-center rounded transition-colors hover:bg-hover"
-                :title="`≥${n}★`"
-                @mouseenter="hoverStars = n"
-                @click="setMinStars(n)"
-              >
-                <Star
-                  class="size-3"
-                  :class="n <= starPreview ? 'fill-amber text-amber' : 'text-ink-3'"
-                />
-              </button>
-            </div>
-            <button
-              class="h-6 shrink-0 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors"
-              :class="ratingFilter === 'unrated' ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
-              @click="ratingFilter = 'unrated'"
-            >
-              未评
+              <LayoutGrid class="shrink-0" :style="{ width: d.icon + 'px', height: d.icon + 'px' }" />
+              <span>{{ d.label }}</span>
+              <span class="ml-auto text-[10px] text-ink-3">{{ d.thumb }}px</span>
+              <Check v-if="i === densityIdx" class="size-3.5 shrink-0 text-amber" />
             </button>
           </div>
-        </div>
-        <button
-          class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
-          :class="{ 'ml-auto': !store.gallery.items.length }"
-          :disabled="store.gallery.loading"
-          @click="load"
-        >
-          <RefreshCw class="size-3.5" :class="{ 'animate-spin': store.gallery.loading }" />
-          刷新
-        </button>
+        </Teleport>
       </div>
+      <button
+        class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
+        :class="{ 'ml-auto': !store.gallery.items.length }"
+        :disabled="store.gallery.loading"
+        @click="load"
+      >
+        <RefreshCw class="size-3.5" :class="{ 'animate-spin': store.gallery.loading }" />
+        刷新
+      </button>
+    </div>
 
+    <!-- 网格区（左列，工具条下方） -->
+    <div class="flex min-h-0 min-w-0 flex-col">
       <!-- 错误 / 空态 -->
       <div v-if="loadError" class="mx-6 mt-4 rounded-xl bg-bad-soft px-4 py-3 text-sm text-bad">
         {{ loadError }}
@@ -842,103 +1087,153 @@ function relDir(item) {
         </div>
       </div>
 
-      <!-- 虚拟网格 -->
-      <div
-        ref="scrollEl"
-        class="min-h-0 flex-1 overflow-y-auto px-6 pb-6 pt-4"
-        @pointerdown="onPointerDown"
-      >
-        <div ref="contentEl" class="relative" :style="{ height: rowVirtualizer.getTotalSize() + 'px' }">
-          <template v-for="vrow in rowVirtualizer.getVirtualItems()" :key="vrow.index">
-            <!-- 月份分组表头 -->
-            <div
-              v-if="rowAt(vrow.index).type === 'header'"
-              :ref="setRowRef"
-              :data-index="vrow.index"
-              class="absolute left-0 top-0 flex w-full items-center gap-2 pt-3"
-              :style="{ transform: `translateY(${vrow.start}px)`, height: HEADER_H + 'px' }"
-            >
-              <span class="text-sm font-semibold">{{ rowAt(vrow.index).label }}</span>
-              <span class="text-xs text-ink-3">{{ rowAt(vrow.index).count.toLocaleString() }} 项</span>
-              <span class="ml-1 h-px flex-1 bg-line"></span>
-            </div>
-
-            <!-- 单元行 -->
-            <div
-              v-else
-              :ref="setRowRef"
-              :data-index="vrow.index"
-              class="absolute left-0 top-0 w-full"
-              :style="{
-                transform: `translateY(${vrow.start}px)`,
-                height: ROW_H + GAP + 'px',
-                display: 'grid',
-                gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-                gap: GAP + 'px',
-              }"
-            >
+      <!-- 虚拟网格：包装层不滚动，吸顶条才能绝对定位到工具条底边 -->
+      <div class="relative min-h-0 flex-1">
+        <div
+          ref="scrollEl"
+          class="absolute inset-0 overflow-y-auto px-6 pb-6 pt-4"
+          @pointerdown="onPointerDown"
+          @scroll.passive="scheduleSticky"
+        >
+          <div ref="contentEl" class="relative" :style="{ height: rowVirtualizer.getTotalSize() + 'px' }">
+            <template v-for="vrow in rowVirtualizer.getVirtualItems()" :key="vrow.index">
+              <!-- 月份分组表头 -->
               <div
-                v-for="(item, localIdx) in rowAt(vrow.index).items"
-                :key="item.path"
-                data-cell
-                class="cursor-default rounded-xl p-1 transition-colors"
-                :class="selected.has(item.path) ? 'bg-amber-soft ring-1 ring-amber' : 'hover:bg-hover'"
-                @click="onCellClick(item, rowAt(vrow.index).startIndex + localIdx, $event)"
-                @dblclick="openItem(item)"
+                v-if="rowAt(vrow.index).type === 'header'"
+                :ref="setRowRef"
+                :data-index="vrow.index"
+                class="absolute left-0 top-0 flex w-full items-center gap-2 pt-3"
+                :style="{ transform: `translateY(${vrow.start}px)`, height: HEADER_H + 'px' }"
               >
-                <div class="relative overflow-hidden rounded-lg bg-subtle" :style="{ height: THUMB_H + 'px' }">
-                  <img
-                    v-if="!failed.has(item.path)"
-                    :src="thumbUrl(item.path)"
-                    class="size-full object-cover"
-                    loading="lazy"
-                    decoding="async"
-                    draggable="false"
-                    @error="onThumbError(item.path)"
-                  />
-                  <div v-else class="grid size-full place-items-center text-ink-3">
-                    <component :is="item.kind === 'video' ? Film : FileImage" class="size-8" />
+                <span class="text-sm font-semibold">{{ rowAt(vrow.index).label }}</span>
+                <span class="text-xs text-ink-3">{{ rowAt(vrow.index).count.toLocaleString() }} 项</span>
+                <span class="ml-1 h-px flex-1 bg-line"></span>
+              </div>
+
+              <!-- 单元行 -->
+              <div
+                v-else
+                :ref="setRowRef"
+                :data-index="vrow.index"
+                class="absolute left-0 top-0 w-full"
+                :style="{
+                  transform: `translateY(${vrow.start}px)`,
+                  height: rowH + GAP + 'px',
+                  display: 'grid',
+                  gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+                  gap: GAP + 'px',
+                }"
+              >
+                <div
+                  v-for="(item, localIdx) in rowAt(vrow.index).items"
+                  :key="item.path"
+                  data-cell
+                  class="group cursor-default rounded-xl p-1 transition-colors"
+                  :class="selected.has(item.path) ? 'bg-amber-soft ring-1 ring-amber' : 'hover:bg-hover'"
+                  @click="onCellClick(item, rowAt(vrow.index).startIndex + localIdx, $event)"
+                  @dblclick="openItem(item)"
+                >
+                  <div class="relative overflow-hidden rounded-lg bg-subtle" :style="{ height: thumbH + 'px' }">
+                    <img
+                      v-if="!failed.has(item.path)"
+                      :src="thumbUrl(item.path)"
+                      class="size-full object-cover"
+                      loading="lazy"
+                      decoding="async"
+                      draggable="false"
+                      @error="onThumbError(item.path)"
+                    />
+                    <div v-else class="grid size-full place-items-center text-ink-3">
+                      <component :is="item.kind === 'video' ? Film : FileImage" class="size-8" />
+                    </div>
+                    <!-- 左下角标：格式与评分并排，共用同一 overlay 底色。
+                         评分已放开到全格式，两个角标必须同容器，否则会叠在同一位置 -->
+                    <div class="absolute bottom-1 left-1 flex items-center gap-1">
+                      <span
+                        v-if="item.kind === 'video'"
+                        class="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white"
+                        style="background-color: var(--badge-bg)"
+                      >
+                        <Film class="size-3" />
+                        {{ item.ext.toUpperCase() }}
+                      </span>
+                      <span
+                        v-if="item.rating"
+                        class="flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                        style="background-color: var(--badge-bg)"
+                      >
+                        <Star
+                          class="size-3 fill-current"
+                          :style="{ color: starColor(item.rating) }"
+                        />
+                        {{ item.rating }}
+                      </span>
+                    </div>
+                    <!-- 右下收藏心：已收藏常驻实心；未收藏仅 hover / 选中时出现空心 -->
+                    <button
+                      class="absolute bottom-1 right-1 grid size-6 place-items-center rounded-full transition-opacity"
+                      :class="item.favorite || selected.has(item.path)
+                        ? 'opacity-100 pointer-events-auto'
+                        : 'opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto'"
+                      :style="{ backgroundColor: item.favorite ? 'var(--badge-bg)' : 'rgba(30,26,22,.35)' }"
+                      :title="item.favorite ? '取消收藏（空格）' : '收藏（空格）'"
+                      :aria-pressed="item.favorite"
+                      @pointerdown.stop
+                      @click.stop="onHeartClick(item, $event)"
+                      @dblclick.stop
+                    >
+                      <Heart
+                        class="size-3.5 transition-colors"
+                        :class="item.favorite ? 'fill-current' : ''"
+                        :style="{ color: item.favorite ? 'var(--fav-on)' : 'var(--star-off)' }"
+                        :stroke-width="item.favorite ? 0 : 2"
+                      />
+                    </button>
                   </div>
-                  <span
-                    v-if="item.kind === 'video'"
-                    class="absolute bottom-1 left-1 flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white"
-                  >
-                    <Film class="size-3" />
-                    {{ item.ext.toUpperCase() }}
-                  </span>
-                  <!-- XMP 评分角标（有评分才显示） -->
-                  <span
-                    v-if="item.rating"
-                    class="absolute bottom-1 left-1 flex items-center gap-0.5 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
-                  >
-                    <Star class="size-3 fill-current" />
-                    {{ item.rating }}
-                  </span>
-                </div>
-                <div class="truncate px-0.5 pt-1 text-xs leading-4 text-ink-2" :title="item.name">
-                  {{ item.name }}
+                  <div class="truncate px-0.5 pt-1 text-xs leading-4 text-ink-2" :title="item.name">
+                    {{ item.name }}
+                  </div>
                 </div>
               </div>
-            </div>
-          </template>
+            </template>
 
-          <!-- 框选矩形（content 坐标系） -->
+            <!-- 框选矩形（content 坐标系） -->
+            <div
+              v-if="band"
+              class="pointer-events-none absolute z-10 rounded-md border border-amber bg-amber-soft/40"
+              :style="{
+                left: band.x1 + 'px',
+                top: band.y1 + 'px',
+                width: band.x2 - band.x1 + 'px',
+                height: band.y2 - band.y1 + 'px',
+              }"
+            />
+          </div>
+        </div>
+
+        <!-- 月份吸顶条：absolute 相对「不滚动」的包装层 → 紧贴工具条，
+             把 pt-4 那条会漏出上一行照片的 16px 也一并盖住。
+             overflow-hidden 自己裁掉被下一组顶出的部分；pointer-events-none 让框选/点击穿透。 -->
+        <div
+          v-if="stickyHeader"
+          class="pointer-events-none absolute inset-x-6 top-0 z-20 overflow-hidden"
+          :style="{ height: HEADER_H + 'px' }"
+          aria-hidden="true"
+        >
           <div
-            v-if="band"
-            class="pointer-events-none absolute z-10 rounded-md border border-amber bg-amber-soft/40"
-            :style="{
-              left: band.x1 + 'px',
-              top: band.y1 + 'px',
-              width: band.x2 - band.x1 + 'px',
-              height: band.y2 - band.y1 + 'px',
-            }"
-          />
+            class="flex items-center gap-2 bg-app pt-3"
+            :style="{ transform: `translateY(${stickyShift}px)`, height: HEADER_H + 'px' }"
+          >
+            <span class="text-sm font-semibold">{{ stickyHeader.label }}</span>
+            <span class="text-xs text-ink-3">{{ stickyHeader.count.toLocaleString() }} 项</span>
+            <span class="ml-1 h-px flex-1 bg-line"></span>
+          </div>
         </div>
       </div>
     </div>
 
     <!-- 右侧信息栏 -->
-    <aside class="flex w-72 shrink-0 flex-col overflow-y-auto border-l border-line bg-surface">
+    <aside class="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-surface">
       <template v-if="singleItem">
         <div class="border-b border-line px-5 pb-4 pt-5">
           <div class="mb-1.5 text-xs text-ink-3">{{ kindLabel(singleItem) }} · {{ singleItem.ext.toUpperCase() }}</div>
@@ -948,38 +1243,60 @@ function relDir(item) {
         <div v-if="infoLoading" class="grid flex-1 place-items-center text-ink-3">
           <LoaderCircle class="size-5 animate-spin" />
         </div>
-        <dl v-else class="flex flex-col gap-3 px-5 py-4 text-sm">
-          <!-- 评分（只支持 JPG / AVIF·HEIC；白名单内但无可写 XMP 位时灰显） -->
-          <div v-if="isRatable(singleItem)">
-            <dt class="mb-1 text-xs text-ink-3">评分</dt>
-            <dd class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
-              <button
-                v-for="i in 5"
-                :key="i"
-                class="rounded p-0.5 transition-transform"
-                :class="{
-                  'scale-110': hoverRating === i && ratingWritable,
-                  'opacity-50': ratingBusy,
-                  'opacity-40 cursor-not-allowed': !ratingWritable,
-                }"
-                :disabled="ratingBusy || !ratingWritable"
-                :title="!ratingWritable ? '此文件没有可写入的内嵌 XMP 评分位' : (i === curRating ? '清除评分' : `${i} 星`)"
-                @mouseenter="hoverRating = i"
-                @click="onRate(i)"
-              >
-                <Star
-                  class="size-[18px] transition-colors"
-                  :class="(hoverRating || curRating) >= i ? 'fill-amber text-amber' : 'text-ink-3'"
-                />
-              </button>
-              <span class="ml-1.5 text-xs text-ink-3">
-                {{ hoverRating || curRating || "未评分" }}
-              </span>
-            </dd>
-            <p v-if="ratingError" class="mt-1 text-xs text-bad">{{ ratingError }}</p>
-            <p v-else-if="!ratingWritable" class="mt-1 text-[11px] leading-4 text-ink-3">
-              此文件没有可写入的内嵌 XMP 评分位，无法打分
-            </p>
+        <dl v-else class="flex flex-col gap-2.5 px-5 py-3 text-sm">
+          <!-- 挑片卡片：评分与收藏同一容器（关联），独立行 + 细分隔线（独立）。
+               dt/dd 横排、紧凑 padding，避免顶部占位过高挤掉元数据 -->
+          <div class="rounded-card border border-line bg-subtle px-3 py-2">
+            <div class="flex items-center justify-between gap-2">
+              <dt class="shrink-0 text-xs text-ink-3">评分</dt>
+              <dd class="flex items-center gap-0.5" @mouseleave="hoverRating = 0">
+                <button
+                  v-for="i in 5"
+                  :key="i"
+                  class="rounded p-0.5 transition-transform"
+                  :class="{
+                    'scale-110': hoverRating === i,
+                    'opacity-50': ratingBusy,
+                  }"
+                  :disabled="ratingBusy"
+                  :title="i === curRating ? '清除评分' : `${i} 星`"
+                  @mouseenter="hoverRating = i"
+                  @click="onRate(i)"
+                >
+                  <Star
+                    class="size-[18px] fill-current transition-colors"
+                    :style="starStyle(i, (hoverRating || curRating) >= i)"
+                  />
+                </button>
+                <span class="ml-1 text-xs text-ink-2">
+                  {{ hoverRating || curRating || "未评分" }}
+                </span>
+              </dd>
+            </div>
+            <div class="mt-1.5 flex items-center justify-between gap-2 border-t border-line pt-1.5">
+              <dt class="shrink-0 text-xs text-ink-3">收藏</dt>
+              <dd class="flex items-center gap-2">
+                <button
+                  class="grid size-6 place-items-center rounded-lg border border-line bg-surface transition-colors hover:bg-hover disabled:opacity-50"
+                  :disabled="favBusy"
+                  :title="singleItem.favorite ? '取消收藏（空格）' : '收藏（空格）'"
+                  :aria-pressed="singleItem.favorite"
+                  @click="onToggleFavorite([singleItem.path])"
+                >
+                  <Heart
+                    class="size-3.5 transition-colors"
+                    :class="singleItem.favorite ? 'fill-current' : ''"
+                    :style="{ color: singleItem.favorite ? 'var(--fav-on)' : 'var(--star-off)' }"
+                    :stroke-width="singleItem.favorite ? 0 : 2"
+                  />
+                </button>
+                <span class="text-xs" :class="singleItem.favorite ? 'text-ink' : 'text-ink-3'">
+                  {{ singleItem.favorite ? "已收藏" : "未收藏" }}
+                </span>
+              </dd>
+            </div>
+            <!-- 两条错误极少同时出现，合并成一行，避免把卡片撑高两行 -->
+            <p v-if="favError || ratingError" class="mt-1 text-xs text-bad">{{ favError || ratingError }}</p>
           </div>
           <div>
             <dt class="mb-0.5 text-xs text-ink-3">拍摄时间</dt>
@@ -1044,17 +1361,27 @@ function relDir(item) {
           <!-- 键盘提示：挑片动作的发现成本（用户不知道有快捷键等于没有） -->
           <p v-if="selected.size <= 1 && displayItems.length" class="mt-3 text-[11px] leading-5 text-ink-3">
             方向键选择 · Shift 扩选 · Enter 打开<br />
-            0-5 打分 · Ctrl+A 全选 · Esc 取消
+            空格收藏 · 0-5 打分 · Ctrl+A 全选 · Esc 取消
           </p>
-          <!-- 批量评分（选中项含可评分文件时可用） -->
-          <div v-if="selected.size > 1 && rateTargets.length" class="mt-4">
-            <div class="mb-1.5 text-xs text-ink-3">
-              批量评分（{{ rateTargets.length }} 张）
+          <!-- 批量评分：评分与格式无关，选中项全部参与 -->
+          <div v-if="selected.size > 1" class="mt-4">
+            <div class="mb-1.5 flex items-center justify-center gap-2 text-xs text-ink-3">
+              <span>批量评分（{{ rateTargets.length }} 个文件）</span>
+              <button
+                class="grid size-6 place-items-center rounded-md border border-line bg-surface transition-colors hover:bg-hover disabled:opacity-50"
+                :disabled="favBusy"
+                :title="allSelectedFav ? '取消选区收藏（空格）' : '收藏选区（空格）'"
+                :aria-pressed="allSelectedFav"
+                @click="onToggleFavorite()"
+              >
+                <Heart
+                  class="size-3.5"
+                  :class="allSelectedFav ? 'fill-current' : ''"
+                  :style="{ color: allSelectedFav ? 'var(--fav-on)' : 'var(--star-off)' }"
+                  :stroke-width="allSelectedFav ? 0 : 2"
+                />
+              </button>
             </div>
-            <!-- 不静默跳过：让用户知道哪些选中项不会被打分 -->
-            <p v-if="selected.size > rateTargets.length" class="mb-1.5 text-[11px] text-ink-3">
-              另有 {{ selected.size - rateTargets.length }} 个文件不支持评分（视频 / RAW 等）
-            </p>
             <div
               class="flex items-center justify-center gap-0.5"
               @mouseleave="hoverRating = 0"
@@ -1070,17 +1397,14 @@ function relDir(item) {
                 @click="onRate(i)"
               >
                 <Star
-                  class="size-[18px] transition-colors"
-                  :class="hoverRating >= i ? 'fill-amber text-amber' : 'text-ink-3'"
+                  class="size-[18px] fill-current transition-colors"
+                  :style="starStyle(i, hoverRating >= i)"
                 />
               </button>
             </div>
-            <p v-if="ratingError" class="mt-2 text-xs text-bad">{{ ratingError }}</p>
-            <p v-else-if="ratingBusy" class="mt-2 text-xs text-ink-3">正在写入…</p>
+            <p v-if="favError || ratingError" class="mt-2 text-xs text-bad">{{ favError || ratingError }}</p>
+            <p v-else-if="ratingBusy || favBusy" class="mt-2 text-xs text-ink-3">正在保存…</p>
           </div>
-          <p v-else-if="selected.size > 1" class="mt-4 text-[11px] leading-5 text-ink-3">
-            选中项没有可评分的文件<br />（只有 JPG 与 AVIF·HEIC 支持评分）
-          </p>
         </div>
       </div>
     </aside>

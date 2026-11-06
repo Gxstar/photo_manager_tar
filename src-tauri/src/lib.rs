@@ -102,7 +102,11 @@ pub fn run() {
             commands::gallery_list,
             commands::gallery_info,
             commands::gallery_open,
-            commands::gallery_set_rating
+            commands::gallery_set_rating,
+            commands::gallery_set_favorite,
+            commands::ratings_db_path,
+            commands::ratings_import_from_files,
+            commands::ratings_export_sidecars
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

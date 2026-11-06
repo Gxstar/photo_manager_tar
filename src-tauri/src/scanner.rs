@@ -39,12 +39,11 @@ pub fn scan_card_with_progress(
 
 /// 扫描实现。
 ///
-/// 去重语义 = 「卡上这份快门产物是否已落库」，与库内文件的后续编辑无关
-/// （评分 / 裁剪 / 重编码后的库内文件一律视为已导入）。每文件一次 stat：
+/// 去重语义 = 「卡上这份快门产物是否已落库」。前提：库内媒体文件永不修改
+/// （评分只写 SQLite，编辑一律另存副本），故库内字节数恒等于卡上。每文件一次 stat：
 /// - 目标不存在 → New
-/// - 库内字节数 ≥ 卡上 → Exists（含评分/编辑放大，跳过）
-/// - 库内更小 → JPEG 且尾部完整仍算 Exists（裁剪缩小，跳过）；
-///   残缺半截或非 JPEG → Conflict（唯一真嫌疑：进程强杀残留，报告提示，不拷贝）
+/// - 存在且字节数相等 → Exists（跳过）
+/// - 存在但字节数不等 → Conflict（强杀残留 / 同名不同内容，报告提示，不拷贝）
 fn scan_card_inner(
     device_path: &str,
     cfg: &AppConfig,
@@ -295,7 +294,9 @@ fn build_library_index(lib: &Path, cfg: &AppConfig) -> Option<LibIndex> {
                 continue;
             }
             let ext = classify::ext_of(entry.path());
-            if ext.is_empty() {
+            // sidecar 不参与改名检测：批量导出的 .xmp 大小高度雷同，会污染
+            // (size, ext) 签名索引并放大误报；媒体文件才是改名检测的对象
+            if ext.is_empty() || classify::classify(&ext) == FileKind::Sidecar {
                 continue;
             }
             let Ok(m) = entry.metadata() else { continue };
@@ -438,43 +439,16 @@ fn pending_dir(lib: &Path, cfg: &AppConfig) -> PathBuf {
 
 /// 目标三态判定：一次 stat 拿存在性 + 字节数。
 ///
-/// 判重对象是「快门产物是否已导入」，不是「库内字节是否与卡上一致」：
-/// 卡上文件永远不被修改，评分/裁剪等编辑只发生在库内，均不改变「已导入」事实。
+/// 前提（2026-11-05 用户拍板）：**库内媒体文件永不修改**，编辑一律另存新副本。
+/// 因此库内同一快门产物的字节数恒等于卡上，不再需要为「评分/裁剪/重编码」
+/// 保留放大或缩小的宽容分支（旧的 JPEG 尾部 FF D9 检查已删除）。
 pub(crate) fn stat_target(target: &Path, size: u64) -> FileStatus {
-    let Ok(m) = fs::metadata(target) else {
-        return FileStatus::New;
-    };
-    if m.len() >= size {
-        return FileStatus::Exists;
+    match fs::metadata(target) {
+        Err(_) => FileStatus::New,
+        Ok(m) if m.len() == size => FileStatus::Exists,
+        // 同名同月却字节数不同：进程强杀残留 / 同名不同内容，不拷贝、报告提示
+        Ok(_) => FileStatus::Conflict,
     }
-    if jpeg_tail_complete(target) {
-        return FileStatus::Exists;
-    }
-    FileStatus::Conflict
-}
-
-/// JPEG 尾部完整性：文件最后 2 字节为 FF D9（EOI）。
-///
-/// 拷贝是顺序直写，强杀残留 = 卡上文件的字节前缀，必然没有 EOI；
-/// 裁剪/重编码输出的完整 JPEG 尾部必有 EOI —— 以此区分「编辑缩小」与「残留」。
-fn jpeg_tail_complete(path: &Path) -> bool {
-    let is_jpeg = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
-        .unwrap_or(false);
-    if !is_jpeg {
-        return false;
-    }
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    if f.seek(SeekFrom::End(-2)).is_err() {
-        return false;
-    }
-    let mut tail = [0u8; 2];
-    f.read_exact(&mut tail).is_ok() && tail == [0xFF, 0xD9]
 }
 
 /// 目标盘剩余空间（取库根所在盘符）
