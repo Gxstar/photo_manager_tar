@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::scanner;
 use crate::state::AppState;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State, ipc::Channel};
@@ -274,6 +274,122 @@ pub fn open_in_explorer(path: String) -> AppResult<()> {
     };
     tauri_plugin_opener::open_path(target.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| AppError::IoError(e.to_string()))?;
+    Ok(())
+}
+
+// ── 外部编辑器（网格右键「使用 Photoshop 打开」）────────────────────────
+
+/// 自动探测 Photoshop.exe：扫描常见 Adobe 安装目录下 `Adobe Photoshop *\Photoshop.exe`。
+/// 目录名逐年变化（2024 / 2025 / CC 2019），按其中的 4 位年份降序取最新版。
+/// 刻意不读注册表：那需要新增 crate，或起 `reg query` 子进程闪黑窗；
+/// 装在非默认盘 / 绿色版由设置页手动指定兜底。
+fn find_photoshop_exe() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(key) {
+            roots.push(PathBuf::from(v).join("Adobe"));
+        }
+    }
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(v).join("Programs").join("Adobe"));
+    }
+    // 环境变量缺失（服务/精简环境）时的兜底
+    roots.push(PathBuf::from(r"C:\Program Files\Adobe"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\Adobe"));
+
+    let mut hits: Vec<(u32, PathBuf)> = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_ascii_lowercase().starts_with("adobe photoshop") {
+                continue;
+            }
+            let exe = entry.path().join("Photoshop.exe");
+            if !exe.is_file() {
+                continue;
+            }
+            let year = name
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+                .find(|y| (1990..=2100).contains(y))
+                .unwrap_or(0);
+            hits.push((year, exe));
+        }
+    }
+    // 年份优先，同年按路径名降序（重复扫描同一目录不影响结果）
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    hits.into_iter().next().map(|(_, p)| p)
+}
+
+/// 手动指定的路径优先；无效或为空时退回自动探测（一个坏路径不该让功能彻底不可用）
+fn resolve_photoshop(configured: &str) -> Option<PathBuf> {
+    let p = configured.trim();
+    if !p.is_empty() {
+        let exe = PathBuf::from(p);
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    find_photoshop_exe()
+}
+
+/// 自动探测结果，供设置页展示「自动找到」的路径
+#[tauri::command]
+pub fn detect_photoshop() -> Option<String> {
+    find_photoshop_exe().map(|p| p.to_string_lossy().to_string())
+}
+
+/// 指定 / 清除外部编辑器路径；空串 = 恢复自动探测
+#[tauri::command]
+pub fn set_photoshop_path(path: String, state: State<'_, AppState>) -> AppResult<AppConfig> {
+    let trimmed = path.trim().to_string();
+    if !trimmed.is_empty() {
+        let p = Path::new(&trimmed);
+        let is_exe = p
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false);
+        if !p.is_file() || !is_exe {
+            return Err(AppError::IoError("请选择有效的 Photoshop.exe".into()));
+        }
+    }
+    let mut cfg = state.config.lock().unwrap().clone();
+    cfg.photoshop_path = trimmed;
+    config::save(&cfg)?;
+    state.update_config(cfg.clone());
+    Ok(cfg)
+}
+
+/// 用 Photoshop 打开（可一次传多个文件，PS 命令行原生支持）。
+/// 只启动外部程序，绝不改动文件；spawn 后立刻返回，不等待 PS 退出。
+#[tauri::command]
+pub fn open_with_photoshop(paths: Vec<String>, state: State<'_, AppState>) -> AppResult<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let exe = {
+        let cfg = state.config.lock().unwrap();
+        resolve_photoshop(&cfg.photoshop_path)
+    }
+    .ok_or_else(|| {
+        AppError::IoError("未找到 Photoshop.exe，请到「设置 → 外部编辑器」手动指定".into())
+    })?;
+
+    let files: Vec<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| Path::new(*p).is_file())
+        .collect();
+    if files.is_empty() {
+        return Err(AppError::IoError("文件不存在或已被移动".into()));
+    }
+    std::process::Command::new(&exe)
+        .args(files)
+        .spawn()
+        .map_err(|e| AppError::IoError(format!("启动 Photoshop 失败：{e}")))?;
     Ok(())
 }
 

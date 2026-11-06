@@ -9,6 +9,7 @@ import {
   Aperture,
   Check,
   ChevronDown,
+  ExternalLink,
   Film,
   FileImage,
   FolderOpen,
@@ -20,6 +21,7 @@ import {
   PanelRightClose,
   RefreshCw,
   Star,
+  WandSparkles,
 } from "lucide-vue-next";
 import { store, loadGallery, watchGalleryTimes, watchGalleryChanged, formatBytes, errMsg } from "../store.js";
 
@@ -45,6 +47,12 @@ const contentEl = ref(null);
 const cols = ref(4);
 const cellW = ref(DENSITIES[1].cell);
 let ro = null;
+// 工具条窄度：按工具条「实际布局宽度」降级。用 ResizeObserver 而非 CSS 断点：
+// 阈值与侧栏 / 视口宽度解耦，也不受窗口缩放方式影响。
+const toolbarEl = ref(null);
+const toolbarNarrow = ref(false);
+let toolbarRo = null;
+const TOOLBAR_NARROW = 900; // 内容宽；1280 窗口约 992，1024 窗口约 736
 
 function readDensity() {
   try {
@@ -78,6 +86,8 @@ const menuPos = ref({ top: 0, left: 0 });
 const MENU_W = 144;
 
 function toggleViewMenu() {
+  // 两个菜单互斥：打开「查看」就收起网格右键菜单
+  ctxOpen.value = false;
   if (viewMenuOpen.value) {
     viewMenuOpen.value = false;
     return;
@@ -94,21 +104,26 @@ function toggleViewMenu() {
 function setDensity(i) {
   viewMenuOpen.value = false;
   if (i === densityIdx.value) return;
+  // 切档会改列数与行高，先在旧布局上取锚点，重排后再把视口拉回原处
+  const anchor = captureLayoutAnchor();
   densityIdx.value = i;
   try {
     localStorage.setItem(DENSITY_KEY, DENSITIES[i].id);
   } catch {
     // 存不了不影响本次会话的使用
   }
+  scheduleRelayout(anchor);
 }
 
 function onGlobalPointerDown(e) {
   if (viewMenuOpen.value && !e.target.closest("[data-view-menu]")) viewMenuOpen.value = false;
+  if (ctxOpen.value && !e.target.closest("[data-ctx-menu]")) ctxOpen.value = false;
 }
 
 // 窗口尺寸变了，fixed 菜单的坐标会失准，直接收起最简单
 function onWindowResize() {
   viewMenuOpen.value = false;
+  ctxOpen.value = false;
 }
 
 // ── 信息栏开合 ────────────────────────────────────────────────────────────
@@ -129,18 +144,15 @@ function readPanelOpen() {
 const panelOpen = ref(readPanelOpen());
 
 function togglePanel() {
+  // 先记下旧布局的视口锚点：列数一变，同一个 scrollTop 会落到完全不同的内容上
+  const anchor = captureLayoutAnchor();
   panelOpen.value = !panelOpen.value;
   try {
     localStorage.setItem(PANEL_KEY, panelOpen.value ? "1" : "0");
   } catch {
     // 记住与否不影响本次使用
   }
-  // 列宽变了：重算列数 + 虚拟行尺寸，避免滚到一半行错位
-  nextTick(() => {
-    measure();
-    rowVirtualizer.value?.measure();
-    scheduleSticky();
-  });
+  scheduleRelayout(anchor);
 }
 
 // ── 类型筛选 ─────────────────────────────────────────────────────────────
@@ -327,15 +339,9 @@ watch(rows, async () => {
   scheduleSticky();
 });
 
-// 切档：容器宽度没变 → ResizeObserver 不触发，必须主动重算 cols；
-// 行高也变了，且窄窗口下 cols 可能恰好不变（rows 引用不变、上面的 watch 不触发），
-// 所以要显式清一次虚拟器尺寸缓存，否则残留旧行高会导致行错位。
-watch(densityIdx, async () => {
-  measure();
-  await nextTick();
-  rowVirtualizer.value?.measure();
-  scheduleSticky();
-});
+// 切档的重排与视口锚定统一走 setDensity → scheduleRelayout：
+// 容器宽度没变，ResizeObserver 不会触发，必须主动重算 cols 与清虚拟器尺寸缓存
+// （即使 cols 恰好不变也要清，否则残留旧行高会错位）。
 
 function rowAt(i) {
   return rows.value[i] ?? { type: "cells", items: [], startIndex: 0 };
@@ -442,8 +448,14 @@ async function load() {
 
 onMounted(() => {
   measure();
-  ro = new ResizeObserver(measure);
+  // 信息栏开合 / 窗口缩放都会改 contentEl 宽度；在旧布局上取锚点后统一重排
+  ro = new ResizeObserver(() => scheduleRelayout(captureLayoutAnchor()));
   ro.observe(contentEl.value);
+  toolbarRo = new ResizeObserver(() => {
+    // clientWidth 含 px-6 左右 padding（共 48），换算成内容宽再比阈值
+    toolbarNarrow.value = (toolbarEl.value?.clientWidth ?? 0) < TOOLBAR_NARROW + 48;
+  });
+  toolbarRo.observe(toolbarEl.value);
   watchGalleryTimes();
   watchGalleryChanged();
   window.addEventListener("keydown", onKeydown);
@@ -453,6 +465,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   ro?.disconnect();
+  toolbarRo?.disconnect();
   if (stickyRaf) cancelAnimationFrame(stickyRaf);
   window.removeEventListener("keydown", onKeydown);
   window.removeEventListener("pointerdown", onGlobalPointerDown);
@@ -626,6 +639,90 @@ function ensureVisible(idx) {
   }
 }
 
+// ── 列数变化时的视觉锚定 ──────────────────────────────────────────────────
+// rows 按 cols 分块，列数一变，同一个 scrollTop 会落到完全不同的内容上
+// （信息栏开合 / 窗口缩放 / 缩略图切档都会触发）。重排前记下锚点单元相对视口
+// 的偏移，重排后用新的 rowOffsets 把 scrollTop 调回去，锚点留在原来的屏幕位置。
+// 直接改 scrollTop，不调虚拟器 scrollToIndex（持久 scrollState 会压制
+// measureElement 的尺寸自愈，见 ensureVisible 上方注释）。
+let pendingAnchor; // undefined = 无待处理；null = 无有效锚点
+let relayoutScheduled = false;
+
+/** 视口顶部第一个单元在 displayItems 里的下标 */
+function topVisibleIndex() {
+  const el = scrollEl.value;
+  const content = contentEl.value;
+  if (!el || !content) return -1;
+  const base = content.getBoundingClientRect().top - el.getBoundingClientRect().top;
+  const ri = rowAtY(-base);
+  for (let r = ri; r < rows.value.length; r++) {
+    const row = rows.value[r];
+    if (row.type === "cells" && row.items.length) return row.startIndex;
+  }
+  return -1;
+}
+
+/** 锚点优先单选中的照片（用户正要看它）；否则退到视口顶部第一个单元 */
+function captureLayoutAnchor() {
+  const el = scrollEl.value;
+  const content = contentEl.value;
+  if (!el || !content) return null;
+  let idx = -1;
+  const sel = singleItem.value;
+  if (sel) idx = displayItems.value.findIndex((it) => it.path === sel.path);
+  if (idx < 0) idx = topVisibleIndex();
+  if (idx < 0) return null;
+  const ri = indexRow.value[idx];
+  if (ri == null) return null;
+  const cellTop = content.getBoundingClientRect().top + rowOffsets.value[ri];
+  return {
+    path: displayItems.value[idx]?.path ?? null,
+    idx,
+    offset: cellTop - el.getBoundingClientRect().top,
+  };
+}
+
+function restoreLayoutAnchor(anchor) {
+  const el = scrollEl.value;
+  const content = contentEl.value;
+  if (!anchor || !el || !content) return;
+  let idx = anchor.path
+    ? displayItems.value.findIndex((it) => it.path === anchor.path)
+    : anchor.idx;
+  if (idx < 0 || idx >= displayItems.value.length) return;
+  const ri = indexRow.value[idx];
+  if (ri == null) return;
+  // 分组表头吸顶会盖住顶部 40px：锚点至少留在表头下方
+  const minOffset = headerRows.value.length ? HEADER_H + 8 : 8;
+  const target = Math.max(anchor.offset, minOffset);
+  const cellTop = content.getBoundingClientRect().top + rowOffsets.value[ri];
+  el.scrollTop += cellTop - (el.getBoundingClientRect().top + target);
+  ensureVisible(idx); // 兜底：重排后行高估算有误差时仍滚回可见区
+  scheduleSticky();
+}
+
+/** 合并同一帧里的多次重排（拖窗口时 ResizeObserver 会连续触发） */
+function scheduleRelayout(anchor) {
+  if (anchor !== undefined && pendingAnchor === undefined) pendingAnchor = anchor;
+  if (relayoutScheduled) return;
+  relayoutScheduled = true;
+  nextTick(async () => {
+    relayoutScheduled = false;
+    const a = pendingAnchor ?? null;
+    pendingAnchor = undefined;
+    const before = cols.value;
+    measure();
+    await nextTick();
+    rowVirtualizer.value?.measure();
+    // 列数没变就不动 scrollTop，避免无谓抖动
+    if (a && cols.value !== before) {
+      await nextTick();
+      restoreLayoutAnchor(a);
+    }
+    scheduleSticky();
+  });
+}
+
 function selectRange(a, b) {
   const lo = Math.min(a, b);
   const hi = Math.max(a, b);
@@ -675,8 +772,8 @@ function onKeydown(e) {
   // 空格无条件归收藏（用户拍板）；按钮仍可用 Enter 激活。
   // 焦点在按钮上时也不让位，空格分支会 preventDefault 阻止按钮被重复激活。
   if (tag === "button" && e.key === "Enter") return;
-  // 「查看」菜单打开时网格快捷键先让位（Esc 除外，下面用它收菜单）
-  if (viewMenuOpen.value && e.key !== "Escape") return;
+  // 任一菜单打开时网格快捷键先让位（Esc 除外，下面用它收菜单）
+  if ((viewMenuOpen.value || ctxOpen.value) && e.key !== "Escape") return;
 
   if (e.ctrlKey || e.metaKey) {
     if (e.key.toLowerCase() === "a") {
@@ -734,6 +831,11 @@ function onKeydown(e) {
       return;
     }
     case "Escape":
+      // 先收菜单，不连带清掉选择（对标资源管理器：Esc 只关当前浮层）
+      if (ctxOpen.value) {
+        ctxOpen.value = false;
+        return;
+      }
       if (viewMenuOpen.value) {
         viewMenuOpen.value = false;
         return;
@@ -758,6 +860,88 @@ const openError = ref(null);
 function openItem(item) {
   openError.value = null;
   invoke("gallery_open", { path: item.path }).catch((e) => {
+    openError.value = errMsg(e);
+  });
+}
+
+// ── 网格右键菜单（只负责「把文件交给哪个程序」，不改文件）─────────────────
+// 与「查看」菜单同套路：Teleport 到 body + fixed，避免被 overflow-y-auto / 虚拟行 transform 裁切。
+const CTX_W = 200;
+const CTX_H = 144; // 头部 + 分隔线 + 3 项 + 分隔线 + padding，用于右下越界夹取
+const MAX_CTX_OPEN = 20; // Ctrl+A 全选后误点「打开」会拉起上万进程，必须兜住
+const ctxOpen = ref(false);
+const ctxPos = ref({ top: 0, left: 0 });
+const ctxItems = ref([]); // 打开菜单时的目标快照，避免选择变化导致动作打偏
+const ctxTooMany = computed(() => ctxItems.value.length > MAX_CTX_OPEN);
+const ctxTitle = computed(() =>
+  ctxItems.value.length > 1
+    ? `已选 ${ctxItems.value.length} 项`
+    : (ctxItems.value[0]?.name ?? ""),
+);
+
+function onCellContextMenu(item, idx, e) {
+  e.preventDefault(); // 屏蔽 WebView2 原生右键菜单
+  viewMenuOpen.value = false;
+  // 对标资源管理器：右键未选中项只选它；落在已选中项上保留整组
+  if (!selected.value.has(item.path)) {
+    selectOnly(item.path);
+    anchorIdx.value = idx;
+    cursorIdx.value = idx;
+  }
+  const set = selected.value;
+  ctxItems.value = displayItems.value.filter((it) => set.has(it.path));
+  if (!ctxItems.value.length) ctxItems.value = [item];
+  ctxPos.value = {
+    left: Math.max(8, Math.min(e.clientX, window.innerWidth - CTX_W - 8)),
+    top: Math.max(8, Math.min(e.clientY, window.innerHeight - CTX_H - 8)),
+  };
+  ctxOpen.value = true;
+}
+
+// 网格空白区右键：只关已有菜单 + 屏蔽原生菜单，不改选择
+function onAreaContextMenu(e) {
+  if (!e.target.closest("[data-cell]")) ctxOpen.value = false;
+}
+
+// 网格滚动后 fixed 菜单的坐标就失效了，直接收起
+function onGridScroll() {
+  if (ctxOpen.value) ctxOpen.value = false;
+  scheduleSticky();
+}
+
+async function ctxOpenDefault() {
+  const items = ctxItems.value.slice();
+  ctxOpen.value = false;
+  if (!items.length || items.length > MAX_CTX_OPEN) return;
+  openError.value = null;
+  for (const it of items) {
+    try {
+      await invoke("gallery_open", { path: it.path });
+    } catch (e) {
+      openError.value = errMsg(e);
+      return;
+    }
+  }
+}
+
+async function ctxOpenPhotoshop() {
+  const paths = ctxItems.value.map((it) => it.path);
+  ctxOpen.value = false;
+  if (!paths.length || paths.length > MAX_CTX_OPEN) return;
+  openError.value = null;
+  try {
+    await invoke("open_with_photoshop", { paths });
+  } catch (e) {
+    openError.value = errMsg(e);
+  }
+}
+
+function ctxOpenFolder() {
+  const item = ctxItems.value[0];
+  ctxOpen.value = false;
+  if (!item) return;
+  openError.value = null;
+  invoke("open_in_explorer", { path: item.path }).catch((e) => {
     openError.value = errMsg(e);
   });
 }
@@ -982,40 +1166,54 @@ function relDir(item) {
     class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]"
     :class="panelOpen ? 'grid-cols-[minmax(0,1fr)_18rem]' : 'grid-cols-[minmax(0,1fr)]'"
   >
-    <!-- 全宽工具条：横跨网格区 + 信息栏，不再受网格区宽度限制 -->
-    <div class="col-span-full flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line px-6 py-1.5 text-sm">
-      <template v-if="store.gallery.items.length">
-        <!-- 阈值一旦生效，星星靠颜色表达不够明确，用文字再标一次 -->
-        <span
-          v-if="minStars"
-          class="shrink-0 whitespace-nowrap rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
-          :title="`只看 ≥${minStars}★ `"
-        >≥{{ minStars }}★</span>
-        <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
-        <span v-if="kindFilter !== 'all' || ratingFilter !== 'all' || favoriteFilter" class="shrink-0 whitespace-nowrap text-xs text-ink-3">
-          / 共 {{ store.gallery.items.length.toLocaleString() }} 项
-        </span>
-        <span class="shrink-0 text-ink-3">·</span>
-        <span v-if="totalSize" class="shrink-0 whitespace-nowrap text-ink-2">{{ formatBytes(totalSize) }}</span>
-        <span v-if="timesProgress" class="flex min-w-0 items-center gap-1.5 truncate text-xs text-ink-2">
-          <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
-          <span class="truncate">正在读取拍摄时间与评分 {{ timesProgress }}（首次较慢）</span>
-        </span>
-      </template>
-      <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
-      <span v-if="openError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="openError">{{ openError }}</span>
-      <div v-if="store.gallery.items.length" class="ml-auto flex shrink-0 items-center gap-1.5">
+    <!-- 全宽工具条：横跨网格区 + 信息栏，不再受网格区宽度限制。
+         固定单行：筛选后左侧统计会多出「/ 共 N 项」「≥N★」，若允许换行，
+         刚性的筛选组就会被整组挤到第二行。左侧统计是唯一可收缩区（空间不足
+         时从右往左裁低优先级文字），右侧控件刚性保留；极窄时低价值信息先让位，
+         仍放不下才横向滚动。 -->
+    <!-- min-w-0：作为 grid item 不按内容撑宽，窄窗口才会走工具条内部横向滚动 -->
+    <div ref="toolbarEl" class="toolbar col-span-full flex min-h-11 min-w-0 flex-nowrap items-center gap-x-3 overflow-x-auto border-b border-line px-6 py-1.5 text-sm">
+      <!-- 左侧统计：唯一弹性区，min-w-0 才能真的收缩 -->
+      <div class="flex min-w-0 flex-1 items-center gap-x-3 overflow-hidden">
+        <template v-if="store.gallery.items.length">
+          <!-- 阈值一旦生效，星星靠颜色表达不够明确，用文字再标一次 -->
+          <span
+            v-if="minStars"
+            class="shrink-0 whitespace-nowrap rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
+            :title="`只看 ≥${minStars}★ `"
+          >≥{{ minStars }}★</span>
+          <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
+          <!-- 以下三项可收缩：空间不足时按「进度 → 大小 → 分母」依次让位，
+               truncate 成省略号，不会出现半截字被硬裁；「N 项」与星级徽标刚性保留。
+               工具条更窄时由 @container 直接隐藏（stat-secondary），把宽度全让给控件 -->
+          <span v-if="kindFilter !== 'all' || ratingFilter !== 'all' || favoriteFilter" class="stat-secondary min-w-0 truncate text-xs text-ink-3" :class="{ 'is-narrow-hide': toolbarNarrow }">
+            / 共 {{ store.gallery.items.length.toLocaleString() }} 项
+          </span>
+          <div v-if="totalSize" class="stat-secondary flex min-w-0 shrink-[10] items-center gap-x-3 text-ink-2" :class="{ 'is-narrow-hide': toolbarNarrow }">
+            <span class="shrink-0 text-ink-3">·</span>
+            <span class="min-w-0 truncate">{{ formatBytes(totalSize) }}</span>
+          </div>
+          <span v-if="timesProgress" class="stat-secondary flex min-w-0 shrink-[100] items-center gap-1.5 text-xs text-ink-2" :class="{ 'is-narrow-hide': toolbarNarrow }">
+            <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
+            <span class="truncate">正在读取拍摄时间与评分 {{ timesProgress }}（首次较慢）</span>
+          </span>
+        </template>
+        <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
+        <span v-if="openError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="openError">{{ openError }}</span>
+      </div>
+      <div v-if="store.gallery.items.length" class="flex shrink-0 items-center gap-1.5">
         <div class="flex h-7 items-center gap-0.5 rounded-lg bg-subtle p-0.5">
           <button
             v-for="opt in filterOpts"
             :key="opt.value"
             class="flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-xs transition-colors"
             :class="kindFilter === opt.value ? 'bg-surface text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
+            :title="opt.value === 'all' ? '全部文件' : `${opt.label} ${(kindCounts[opt.value] ?? 0).toLocaleString()} 项`"
             @click="kindFilter = opt.value"
           >
             <component :is="opt.icon" class="size-3" />
             {{ opt.label }}
-            <span v-if="opt.value !== 'all'" class="text-[10px] text-ink-3">{{ (kindCounts[opt.value] ?? 0).toLocaleString() }}</span>
+            <span v-if="opt.value !== 'all'" class="count-badge text-[10px] text-ink-3" :class="{ 'is-narrow-hide': toolbarNarrow }">{{ (kindCounts[opt.value] ?? 0).toLocaleString() }}</span>
           </button>
         </div>
 
@@ -1066,7 +1264,7 @@ function relDir(item) {
           <button
             class="flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2 text-xs transition-colors"
             :class="favoriteFilter ? 'bg-surface font-medium text-ink shadow-sm' : 'text-ink-2 hover:text-ink'"
-            :title="favoriteFilter ? '只看收藏（再点取消）' : '只看已收藏的文件'"
+            :title="favoriteFilter ? `只看收藏（${favoriteCount.toLocaleString()} 项，再点取消）` : `只看已收藏的文件（${favoriteCount.toLocaleString()} 项）`"
             :aria-pressed="favoriteFilter"
             @click="favoriteFilter = !favoriteFilter"
           >
@@ -1076,7 +1274,7 @@ function relDir(item) {
               :style="favoriteFilter ? { color: 'var(--fav-on)' } : undefined"
             />
             <span>收藏</span>
-            <span class="text-[10px] text-ink-2 tabular-nums">{{ favoriteCount.toLocaleString() }}</span>
+            <span class="count-badge text-[10px] text-ink-2 tabular-nums" :class="{ 'is-narrow-hide': toolbarNarrow }">{{ favoriteCount.toLocaleString() }}</span>
           </button>
         </div>
 
@@ -1091,7 +1289,7 @@ function relDir(item) {
             @click="toggleViewMenu"
           >
             <LayoutGrid class="size-3.5" />
-            <span>{{ density.label }}</span>
+            <span class="view-label" :class="{ 'is-narrow-hide': toolbarNarrow }">{{ density.label }}</span>
             <ChevronDown class="size-3 transition-transform" :class="{ 'rotate-180': viewMenuOpen }" />
           </button>
         </div>
@@ -1118,27 +1316,25 @@ function relDir(item) {
           </div>
         </Teleport>
       </div>
-      <!-- 信息栏开合：窄窗下把 288px 还给网格 -->
+      <!-- 信息栏开合 / 刷新：纯图标，省下约 70px 给筛选控件（含义走 title + aria-label） -->
       <button
-        class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs transition-colors"
-        :class="[
-          { 'ml-auto': !store.gallery.items.length },
-          panelOpen ? 'text-ink-2 hover:bg-hover' : 'bg-hover text-ink',
-        ]"
+        class="grid size-7 shrink-0 place-items-center rounded-lg transition-colors"
+        :class="panelOpen ? 'text-ink-2 hover:bg-hover' : 'bg-hover text-ink'"
         :title="panelOpen ? '收起信息栏' : '展开信息栏'"
+        :aria-label="panelOpen ? '收起信息栏' : '展开信息栏'"
         :aria-pressed="panelOpen"
         @click="togglePanel"
       >
-        <component :is="panelOpen ? PanelRightClose : PanelRight" class="size-3.5" />
-        信息
+        <component :is="panelOpen ? PanelRightClose : PanelRight" class="size-4" />
       </button>
       <button
-        class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
+        class="grid size-7 shrink-0 place-items-center rounded-lg text-ink-2 transition-colors hover:bg-hover disabled:opacity-50"
         :disabled="store.gallery.loading"
+        title="刷新图库（重新扫描媒体库）"
+        aria-label="刷新图库"
         @click="load"
       >
-        <RefreshCw class="size-3.5" :class="{ 'animate-spin': store.gallery.loading }" />
-        刷新
+        <RefreshCw class="size-4" :class="{ 'animate-spin': store.gallery.loading }" />
       </button>
     </div>
 
@@ -1173,7 +1369,8 @@ function relDir(item) {
           ref="scrollEl"
           class="absolute inset-0 overflow-y-auto px-6 pb-6 pt-4"
           @pointerdown="onPointerDown"
-          @scroll.passive="scheduleSticky"
+          @scroll.passive="onGridScroll"
+          @contextmenu.prevent="onAreaContextMenu"
         >
           <div ref="contentEl" class="relative" :style="{ height: rowVirtualizer.getTotalSize() + 'px' }">
             <template v-for="vrow in rowVirtualizer.getVirtualItems()" :key="vrow.index">
@@ -1212,6 +1409,7 @@ function relDir(item) {
                   :class="selected.has(item.path) ? 'bg-amber-soft ring-1 ring-amber' : 'hover:bg-hover'"
                   @click="onCellClick(item, rowAt(vrow.index).startIndex + localIdx, $event)"
                   @dblclick="openItem(item)"
+                  @contextmenu="onCellContextMenu(item, rowAt(vrow.index).startIndex + localIdx, $event)"
                 >
                   <div class="relative overflow-hidden rounded-lg bg-subtle" :style="{ height: thumbH + 'px' }">
                     <img
@@ -1465,5 +1663,67 @@ function relDir(item) {
         </div>
       </template>
     </aside>
+
+    <!-- 网格右键菜单：Teleport 到 body + fixed，不受网格滚动与虚拟行 transform 裁切 -->
+    <Teleport to="body">
+      <div
+        v-if="ctxOpen"
+        class="fixed z-50 rounded-card border border-line bg-surface p-1 shadow-card"
+        :style="{ top: ctxPos.top + 'px', left: ctxPos.left + 'px', width: CTX_W + 'px' }"
+        data-ctx-menu
+        @contextmenu.prevent
+      >
+        <div class="truncate px-2.5 py-1 text-[11px] text-ink-3" :title="ctxTitle">
+          {{ ctxTooMany ? `一次最多打开 ${MAX_CTX_OPEN} 项` : ctxTitle }}
+        </div>
+        <div class="my-1 h-px bg-line"></div>
+        <button
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors"
+          :class="ctxTooMany ? 'cursor-not-allowed opacity-45' : 'hover:bg-hover'"
+          :disabled="ctxTooMany"
+          @click="ctxOpenDefault"
+        >
+          <ExternalLink class="size-3.5 shrink-0" />
+          <span>打开</span>
+          <span v-if="ctxItems.length > 1" class="ml-auto text-[10px] text-ink-3">{{ ctxItems.length }} 项</span>
+        </button>
+        <button
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors"
+          :class="ctxTooMany ? 'cursor-not-allowed opacity-45' : 'hover:bg-hover'"
+          :disabled="ctxTooMany"
+          @click="ctxOpenPhotoshop"
+        >
+          <WandSparkles class="size-3.5 shrink-0" />
+          <span>使用 Photoshop 打开</span>
+          <span v-if="ctxItems.length > 1" class="ml-auto text-[10px] text-ink-3">{{ ctxItems.length }} 项</span>
+        </button>
+        <div class="my-1 h-px bg-line"></div>
+        <button
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors hover:bg-hover"
+          @click="ctxOpenFolder"
+        >
+          <FolderOpen class="size-3.5 shrink-0" />
+          <span>打开所在文件夹</span>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
+
+<style scoped>
+/* 工具条放不下时横向滚动而不是换行，隐藏细滚动条避免占掉 44px 高度 */
+.toolbar {
+  scrollbar-width: none;
+}
+.toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* 工具条内容宽 < 900px 时由 toolbarNarrow（ResizeObserver）挂上此类：
+   低价值信息让位，保证类型 / 评分 / 收藏 / 查看 / 信息 / 刷新全部同行可见。
+   阈值按工具条实际布局宽度判断，与侧栏 / 视口宽度解耦。
+   信息没丢：分类计数、收藏数、缩略图档位分别在各自按钮的 title 里。 */
+.is-narrow-hide {
+  display: none !important; /* 压过 .flex 等 display 工具类 */
+}
+</style>

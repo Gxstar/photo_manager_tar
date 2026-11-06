@@ -30,6 +30,7 @@ export const store = reactive({
   gallery: {
     items: [], // GalleryItem[]（初始按路径排序，时间补齐后按拍摄时间降序重排）
     loading: false,
+    loaded: false, // 是否已请求过列表（空库也算）；热刷新据此判断，不用 items.length
     timesDone: 0, // 元数据（拍摄时间+评分）补齐进度
     timesTotal: 0,
   },
@@ -126,6 +127,10 @@ export function sortGalleryItems() {
   });
 }
 
+// 重拉期间到达的变更事件只记一个标记，由「当前这次加载」在结束时补跑。
+// 放在 loadGallery 而不是事件回调里：手动刷新 / 首次加载撞上事件也不会漏掉。
+let galleryDirty = false;
+
 export async function loadGallery() {
   store.gallery.loading = true;
   try {
@@ -133,6 +138,12 @@ export async function loadGallery() {
     sortGalleryItems();
   } finally {
     store.gallery.loading = false;
+    // 失败也算「请求过」：库临时不可达时，后续文件变更仍能触发重拉恢复
+    store.gallery.loaded = true;
+    if (galleryDirty) {
+      galleryDirty = false;
+      queueMicrotask(() => loadGallery().catch(() => {}));
+    }
   }
 }
 
@@ -164,14 +175,22 @@ export function watchGalleryTimes() {
 
 let galleryChangedWatched = false;
 
-/** 监听媒体库文件系统变更（后端 2s 防抖聚合）：重拉列表实现热刷新 */
+/**
+ * 监听媒体库文件系统变更（后端 2s 防抖聚合）：重拉列表实现热刷新。
+ * 判空用 loaded 而不是 items.length —— 否则空库时外部拷入的第一批文件
+ * 触发的事件会被丢掉，界面永远停在「媒体库为空」，只能手动刷新。
+ * 加载期间到达的事件只置 galleryDirty，由 loadGallery 的 finally 统一补跑。
+ */
 export function watchGalleryChanged() {
   if (galleryChangedWatched) return;
   galleryChangedWatched = true;
   listen("gallery-changed", () => {
-    // 仅图库已加载过时重拉（未加载过由页面挂载触发首次加载）
-    if (store.gallery.items.length && !store.gallery.loading) {
-      loadGallery();
+    if (!store.gallery.loaded) return; // 还没请求过列表：交给页面挂载时的首次加载
+    if (store.gallery.loading) {
+      galleryDirty = true;
+      return;
     }
+    // 自动重拉失败不打断页面（拔盘等临时故障常见）；点「刷新」时由 loadError 呈现
+    loadGallery().catch(() => {});
   });
 }

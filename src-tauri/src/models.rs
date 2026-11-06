@@ -172,6 +172,9 @@ pub struct AppConfig {
     pub last_page: String,
     /// 插卡后自动扫描（只读卡、不改卡、不自动拷贝）
     pub auto_scan: bool,
+    /// 外部编辑器 Photoshop.exe 的绝对路径；空串 = 启动时自动探测 Adobe 安装目录。
+    /// 同样靠结构体级 `#[serde(default)]` 兜底，旧 config.json 缺字段不影响其它配置。
+    pub photoshop_path: String,
 }
 
 impl Default for AppConfig {
@@ -185,6 +188,7 @@ impl Default for AppConfig {
             conflict_policy: ConflictPolicy::Skip,
             last_page: "copy".to_string(),
             auto_scan: true,
+            photoshop_path: String::new(),
         }
     }
 }

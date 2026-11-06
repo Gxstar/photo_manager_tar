@@ -191,13 +191,20 @@ fn scan_existing_month_all_exists() {
     };
     let plan = crate::scanner::scan_card(&card.to_string_lossy(), &cfg).expect("扫描应成功");
 
-    // 期望总数 = 目录实际文件数（排除系统文件）
+    // 期望总数 = 目录内「媒体文件 + sidecar」数（排除系统文件）。
+    // 口径必须与 scanner 第一遍的白名单一致（§14）：库里若混入固件 / 压缩包，
+    // 它们本来就不该进计划，数进 expected 只会让这条断言假失败。
+    // 注意这只改夹具计数，不改下面「0 新增 / 全部 Exists / 0 冲突」的核心断言。
     let expected = walkdir::WalkDir::new(&card)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.file_type().is_file()
                 && !crate::meta::classify::is_ignored_name(&e.file_name().to_string_lossy())
+                && !matches!(
+                    crate::meta::classify::classify(&crate::meta::classify::ext_of(e.path())),
+                    FileKind::Unknown
+                )
         })
         .count();
 
@@ -216,6 +223,52 @@ fn scan_existing_month_all_exists() {
         "自扫自库不应触发改名跳过（Exists 优先）"
     );
     assert!(plan.space_ok);
+}
+
+/// 非媒体文件不进拷贝计划（docs/开发方案.md §14）：
+/// 卡根残留的固件 / 压缩包 / 文档等 FileKind::Unknown 一律跳过，
+/// 真媒体文件与其 sidecar 仍照常纳入。用临时目录，不依赖真实媒体库夹具。
+#[test]
+fn unknown_files_are_excluded_from_copy_plan() {
+    let card = std::env::temp_dir().join(format!("sdi-card-unknown-{}", std::process::id()));
+    let lib = std::env::temp_dir().join(format!("sdi-lib-unknown-{}", std::process::id()));
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::create_dir_all(lib.join("原图")).unwrap();
+
+    // 1 张真 JPEG + 1 个 sidecar + 3 个非媒体文件（固件 / 压缩包 / 说明文档）
+    synth_jpeg(&card, "P1265460.JPG", 64, 48);
+    std::fs::write(card.join("P1265460.JPG.xmp"), b"<x:xmpmeta/>").unwrap();
+    std::fs::write(card.join("S9___V21.bin"), b"firmware").unwrap();
+    std::fs::write(card.join("S9___V21.zip"), b"firmware-zip").unwrap();
+    std::fs::write(card.join("readme.txt"), b"notes").unwrap();
+
+    let cfg = crate::models::AppConfig {
+        library_root: lib.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let plan = crate::scanner::scan_card(&card.to_string_lossy(), &cfg).expect("扫描应成功");
+
+    assert_eq!(plan.total_files, 2, "只应有 1 张照片 + 1 个 sidecar");
+    assert_eq!(plan.files.len(), 2);
+    assert!(
+        plan.files.iter().all(|f| !matches!(f.kind, FileKind::Unknown)),
+        "计划里不应残留 Unknown 类别"
+    );
+    assert!(
+        !plan.files.iter().any(|f| matches!(f.ext.as_str(), "bin" | "zip" | "txt")),
+        "固件 / 压缩包 / 文档不应出现在计划里"
+    );
+    assert!(plan
+        .files
+        .iter()
+        .any(|f| f.file_name.eq_ignore_ascii_case("P1265460.JPG")));
+    assert!(plan
+        .files
+        .iter()
+        .any(|f| f.file_name.eq_ignore_ascii_case("P1265460.JPG.xmp")));
+
+    let _ = std::fs::remove_dir_all(&card);
+    let _ = std::fs::remove_dir_all(&lib);
 }
 
 /// 改名场景端到端：临时库里放一个改名后的真实 JPG（内容相同），

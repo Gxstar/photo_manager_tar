@@ -80,6 +80,14 @@ fn scan_card_inner(
         }
         let ext = classify::ext_of(entry.path());
         let kind = classify::classify(&ext);
+        // 非媒体文件（卡根残留的固件 / 压缩包 / 说明文档等）不进计划。
+        // SKIP_DIRS 只挡得住 PRIVATE 等相机私有目录，卡根目录的固件会一路走到 copier
+        // 被归档进媒体库；gallery 又只显示 Image/Raw/Video → 入库后用户看不见，静默污染。
+        // 必须放在 dir_map / raws 之前，两处口径一致，也避免 find_main_file 误把 .bin 当主文件。
+        // 规格见 docs/开发方案.md §14。
+        if kind == FileKind::Unknown {
+            continue;
+        }
         let size = entry.metadata().map_err(|e| AppError::IoError(e.to_string()))?.len();
 
         let parent = entry.path().parent().unwrap_or(Path::new("")).to_path_buf();

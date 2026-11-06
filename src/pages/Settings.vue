@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from "vue";
 // window.confirm 在该 WebView 返回 Promise（恒真），必须用原生对话框插件
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Copy, FolderOpen, FolderPen, HardDrive, FileStack, TriangleAlert } from "lucide-vue-next";
+import { Check, Copy, FolderOpen, FolderPen, HardDrive, FileStack, RotateCcw, TriangleAlert, WandSparkles } from "lucide-vue-next";
 import {
   store,
   loadConfig,
@@ -48,7 +48,52 @@ const interopError = ref(null);
 const interopMsg = ref(null);
 const dbPath = ref("");
 
+// ── 外部编辑器（图库网格右键「使用 Photoshop 打开」）─────────────────────
+const editorError = ref(null);
+const editorBusy = ref(false);
+const editorSaved = ref(false);
+let editorSavedTimer = 0;
+const detectedExe = ref("");
+
+const configuredExe = computed(() => store.config?.photoshopPath || "");
+const effectiveExe = computed(() => configuredExe.value || detectedExe.value);
+
+async function refreshDetected() {
+  try {
+    detectedExe.value = (await invoke("detect_photoshop")) || "";
+  } catch {
+    detectedExe.value = "";
+  }
+}
+
+async function savePhotoshopPath(path) {
+  editorBusy.value = true;
+  editorError.value = null;
+  try {
+    store.config = await invoke("set_photoshop_path", { path });
+    await refreshDetected();
+    editorSaved.value = true;
+    clearTimeout(editorSavedTimer);
+    editorSavedTimer = setTimeout(() => (editorSaved.value = false), 1600);
+  } catch (e) {
+    editorError.value = errMsg(e);
+  } finally {
+    editorBusy.value = false;
+  }
+}
+
+async function pickPhotoshop() {
+  const picked = await open({
+    multiple: false,
+    title: "选择 Photoshop.exe",
+    filters: [{ name: "可执行文件", extensions: ["exe"] }],
+  });
+  const file = Array.isArray(picked) ? picked[0] : picked;
+  if (file) await savePhotoshopPath(file);
+}
+
 onMounted(async () => {
+  refreshDetected();
   try {
     dbPath.value = await invoke("ratings_db_path");
   } catch {
@@ -277,6 +322,47 @@ async function saveRoot(dir) {
           清空记录
         </button>
       </div>
+    </section>
+
+    <!-- 外部编辑器 -->
+    <section class="rounded-card border border-line bg-surface p-5 shadow-card">
+      <h2 class="mb-1 flex items-center gap-1.5 text-sm font-semibold">
+        外部编辑器
+        <span v-if="editorSaved" class="text-[11px] font-normal text-ok">已保存</span>
+      </h2>
+      <p class="mb-3 text-xs leading-relaxed text-ink-2">
+        图库网格右键「使用 Photoshop 打开」会启动此程序。留空时自动查找 Adobe 安装目录；
+        装在非默认盘或绿色版请手动指定一次。
+      </p>
+      <div class="flex items-center gap-2">
+        <div class="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-subtle px-3 text-sm">
+          <WandSparkles class="size-4 shrink-0 text-ink-3" />
+          <span class="truncate" :title="effectiveExe || '未找到'">
+            {{ effectiveExe || "未找到 Photoshop.exe" }}
+          </span>
+          <span v-if="!configuredExe && effectiveExe" class="shrink-0 text-[11px] text-ink-3">自动</span>
+        </div>
+        <button
+          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
+          :disabled="editorBusy"
+          @click="pickPhotoshop"
+        >
+          <FolderPen class="size-4" />
+          选择
+        </button>
+        <button
+          class="grid size-9 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
+          :disabled="editorBusy || !configuredExe"
+          title="恢复自动查找"
+          aria-label="恢复自动查找"
+          @click="savePhotoshopPath('')"
+        >
+          <RotateCcw class="size-4" />
+        </button>
+      </div>
+      <p v-if="editorError" class="mt-2 flex items-center gap-1 text-xs text-bad">
+        <TriangleAlert class="size-3.5" /> {{ editorError }}
+      </p>
     </section>
 
     <!-- 评分与互操作 -->
