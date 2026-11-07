@@ -3,6 +3,7 @@ use crate::copier::CopyControl;
 use crate::gallery::TimeCache;
 use crate::meta_store::MetaStore;
 use crate::models::AppConfig;
+use crate::smart::Smart;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,8 @@ pub struct AppState {
     pub thumbs_sem: Arc<tokio::sync::Semaphore>,
     /// 媒体库文件系统监听（热刷新）；变更库根时顶替重启
     pub watcher: Mutex<Option<crate::watch::WatcherHandle>>,
+    /// 智能相册独立模块：独立 smart.db，删掉即回到无 AI 状态（§17.6）
+    pub smart: Smart,
 }
 
 impl AppState {
@@ -41,6 +44,7 @@ impl AppState {
             gallery_gen: AtomicU64::new(0),
             thumbs_sem: Arc::new(tokio::sync::Semaphore::new(3)),
             watcher: Mutex::new(None),
+            smart: Smart::open(),
         }
     }
 

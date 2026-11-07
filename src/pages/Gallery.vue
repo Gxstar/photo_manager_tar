@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   Aperture,
+  Ban,
   Check,
   ChevronDown,
   ExternalLink,
@@ -20,10 +21,14 @@ import {
   PanelRight,
   PanelRightClose,
   RefreshCw,
+  Search,
   Star,
+  Trash2,
   WandSparkles,
+  X,
 } from "lucide-vue-next";
 import { store, loadGallery, watchGalleryTimes, watchGalleryChanged, formatBytes, errMsg } from "../store.js";
+import PhotoMenu from "../components/PhotoMenu.vue";
 
 // ── 缩略图尺寸档位（对标资源管理器「查看」菜单）──────────────────────────
 // 用户选的是缩略图大小，列数由容器宽度自动算出。格宽与缩略图高按 ~1.28
@@ -118,12 +123,21 @@ function setDensity(i) {
 function onGlobalPointerDown(e) {
   if (viewMenuOpen.value && !e.target.closest("[data-view-menu]")) viewMenuOpen.value = false;
   if (ctxOpen.value && !e.target.closest("[data-ctx-menu]")) ctxOpen.value = false;
+  // 搜索浮层是 Teleport 到 body 的，靠标记判断内外；复核弹窗自带遮罩 @click.self
+  if (
+    searchOpen.value &&
+    !e.target.closest("[data-search-panel]") &&
+    !e.target.closest("[data-search-btn]")
+  ) {
+    searchOpen.value = false;
+  }
 }
 
 // 窗口尺寸变了，fixed 菜单的坐标会失准，直接收起最简单
 function onWindowResize() {
   viewMenuOpen.value = false;
   ctxOpen.value = false;
+  searchOpen.value = false;
 }
 
 // ── 信息栏开合 ────────────────────────────────────────────────────────────
@@ -197,8 +211,16 @@ const starPreview = computed(() => hoverStars.value || minStars.value);
 
 // ── 收藏筛选（二值 toggle，与类型 / 评分筛选 AND 叠加）──────────────────
 const favoriteFilter = ref(false);
+
+// ── 废片标记（docs §15）──────────────────────────────────────────────────
+// 标记只是「从挑片视图隐藏」，文件仍原样留在库里；复核清单是唯一的查看 /
+// 取消标记 / 删除入口。看片时按 X 一键标废片，视图立刻干净；删除留到之后集中做。
+// 所有计数口径都基于 normalItems，避免「分类 6000 项」与「视图 5950 项」打架。
+const normalItems = computed(() => store.gallery.items.filter((it) => !it.rejected));
+const rejectedItems = computed(() => store.gallery.items.filter((it) => it.rejected));
+
 const favoriteCount = computed(
-  () => store.gallery.items.filter((it) => it.favorite).length,
+  () => normalItems.value.filter((it) => it.favorite).length,
 );
 
 /** 一键回到「全部」：筛选组合出空结果时，用户需要一条明确的退路 */
@@ -211,7 +233,7 @@ function clearFilters() {
 const kindCounts = computed(() => {
   // 不含 all：总数已在工具条左侧「N 项」，「全部」按钮不重复展示
   const c = { image: 0, raw: 0, video: 0 };
-  for (const it of store.gallery.items) if (it.kind in c) c[it.kind]++;
+  for (const it of normalItems.value) if (it.kind in c) c[it.kind]++;
   return c;
 });
 
@@ -219,8 +241,9 @@ const displayItems = computed(() => {
   const kind = kindFilter.value;
   const rating = ratingFilter.value;
   const fav = favoriteFilter.value;
-  if (kind === "all" && rating === "all" && !fav) return store.gallery.items;
-  return store.gallery.items.filter((it) => {
+  // 废片始终不进挑片视图（与三段筛选无关），「清除筛选」也不会把它们放回来
+  if (kind === "all" && rating === "all" && !fav) return normalItems.value;
+  return normalItems.value.filter((it) => {
     if (fav && !it.favorite) return false;
     if (kind !== "all" && it.kind !== kind) return false;
     if (rating === "all") return true;
@@ -240,7 +263,7 @@ const emptyHint = computed(() => {
   if (ratingFilter.value === "all") return null;
   const kind = kindFilter.value;
   const pool =
-    kind === "all" ? store.gallery.items : store.gallery.items.filter((it) => it.kind === kind);
+    kind === "all" ? normalItems.value : normalItems.value.filter((it) => it.kind === kind);
   if (!pool.length) return "当前类型下没有文件";
   if (ratingFilter.value === "unrated") return "当前视图里的文件都已经打过分了";
   return `还没有 ≥${minStars.value}★ 的照片，选中后按 0-5 即可打分`;
@@ -476,7 +499,8 @@ onBeforeUnmount(() => {
 const failed = ref(new Set());
 
 function thumbUrl(path) {
-  return `http://thumb.localhost/${encodeURIComponent(path)}`;
+  // v=2：旧版 404 被误标为 immutable，加版本号强制浏览器重新请求（后端 404 已改 no-store）
+  return `http://thumb.localhost/${encodeURIComponent(path)}?v=2`;
 }
 
 function onThumbError(path) {
@@ -499,6 +523,30 @@ const singleItem = computed(() => {
   const path = [...selected.value][0];
   return displayItems.value.find((it) => it.path === path) ?? null;
 });
+
+// ── 拍摄地点：smart.db 里该照片所属 GPS 簇的三级区划 + 详细地址（只读）──────
+const photoLocation = ref(null);
+const photoAdminText = computed(() => {
+  const l = photoLocation.value;
+  if (!l) return "";
+  return [...new Set([l.province, l.city, l.county].filter(Boolean))].join(" · ");
+});
+let locationSeq = 0;
+watch(
+  () => singleItem.value?.path,
+  async (path) => {
+    const seq = ++locationSeq;
+    photoLocation.value = null;
+    if (!path) return;
+    try {
+      const loc = await invoke("smart_photo_location", { path });
+      if (seq === locationSeq) photoLocation.value = loc;
+    } catch {
+      // 无 GPS / 索引未建立时静默不显示，不打断信息栏
+    }
+  },
+  { immediate: true },
+);
 
 function toggleSelect(path, additive) {
   const next = new Set(selected.value);
@@ -603,7 +651,7 @@ function onBandUp() {
 
 // ── 键盘操作（挑片时手不离键盘）─────────────────────────────────────────
 // 映射：方向键移动（Shift 扩选）/ Home·End 首尾 / Enter 打开 /
-// 0-5 打分（0 = 清除）/ Ctrl+A 全选 / Esc 取消选择。
+// 0-5 打分（0 = 清除）/ 空格收藏 / X 标记废片 / Ctrl+A 全选 / Esc 取消选择。
 // 事件挂在 window 上：单元格不可聚焦，靠 activeElement 判断会永远落空。
 
 /** displayItems 下标 → 虚拟行下标（跳过表头行，键盘滚动定位用） */
@@ -636,6 +684,84 @@ function ensureVisible(idx) {
     scrollEl.value.scrollTop -= view.top + padTop - cellTop;
   } else if (cellTop + h > view.bottom) {
     scrollEl.value.scrollTop += cellTop + h - view.bottom + pad;
+  }
+}
+
+// ── 文件名搜索（定位，不是过滤）─────────────────────────────────────────
+// 用户口径：输入文件名 → 跳到那张并选中，月份上下文与相邻照片都保留。
+// 候选集是 displayItems（当前可见集）：筛掉的不搜、隐藏的废片也不搜，
+// 不偷偷改用户已设的筛选。13k 文件名子串匹配是单次内存遍历，无需索引/后端命令。
+// 输入框放 Teleport 浮层里，只给工具条加一个 28px 图标 —— §8.3 为工具条宽度
+// 反复修过三次，常驻输入框会把刚性筛选组挤到第二行。
+const searchOpen = ref(false);
+const searchQuery = ref("");
+const searchInput = ref(null);
+const searchBtn = ref(null);
+const searchPos = ref({ top: 0, left: 0 });
+const searchIdx = ref(-1);
+const SEARCH_W = 288;
+
+const searchMatches = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase();
+  if (!q) return [];
+  const out = [];
+  const list = displayItems.value;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].name.toLowerCase().includes(q)) out.push(i);
+  }
+  return out;
+});
+
+watch(searchQuery, () => {
+  searchIdx.value = -1;
+});
+
+function toggleSearch() {
+  if (searchOpen.value) {
+    searchOpen.value = false;
+    return;
+  }
+  ctxOpen.value = false;
+  viewMenuOpen.value = false;
+  const r = searchBtn.value?.getBoundingClientRect();
+  if (!r) return;
+  searchPos.value = {
+    top: r.bottom + 6,
+    left: Math.max(8, Math.min(r.right - SEARCH_W, window.innerWidth - SEARCH_W - 8)),
+  };
+  searchOpen.value = true;
+  nextTick(() => searchInput.value?.focus());
+}
+
+function closeSearch() {
+  searchOpen.value = false;
+  searchQuery.value = "";
+  searchIdx.value = -1;
+}
+
+/** step = ±1；多个同名匹配（JPG/RW2 同基名、跨月同名）逐个跳，不猜哪一个 */
+function jumpToMatch(step) {
+  const m = searchMatches.value;
+  if (!m.length) return;
+  const base = searchIdx.value < 0 ? (step > 0 ? -1 : 0) : searchIdx.value;
+  searchIdx.value = (base + step + m.length) % m.length;
+  const idx = m[searchIdx.value];
+  const it = displayItems.value[idx];
+  if (!it) return;
+  selected.value = new Set([it.path]);
+  anchorIdx.value = idx;
+  cursorIdx.value = idx;
+  ensureVisible(idx); // 已处理月份表头吸顶的 40px，不需要另写滚动逻辑
+}
+
+function onSearchKeydown(e) {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    jumpToMatch(e.shiftKey ? -1 : 1);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    closeSearch();
   }
 }
 
@@ -772,8 +898,12 @@ function onKeydown(e) {
   // 空格无条件归收藏（用户拍板）；按钮仍可用 Enter 激活。
   // 焦点在按钮上时也不让位，空格分支会 preventDefault 阻止按钮被重复激活。
   if (tag === "button" && e.key === "Enter") return;
-  // 任一菜单打开时网格快捷键先让位（Esc 除外，下面用它收菜单）
-  if ((viewMenuOpen.value || ctxOpen.value) && e.key !== "Escape") return;
+  // 任一浮层打开时网格快捷键先让位（Esc 除外，下面用它收浮层）。
+  // 复核弹窗尤其重要：否则在弹窗里按 X 会顺手把网格里的照片标成废片。
+  if (
+    (viewMenuOpen.value || ctxOpen.value || searchOpen.value || reviewOpen.value) &&
+    e.key !== "Escape"
+  ) return;
 
   if (e.ctrlKey || e.metaKey) {
     if (e.key.toLowerCase() === "a") {
@@ -831,7 +961,15 @@ function onKeydown(e) {
       return;
     }
     case "Escape":
-      // 先收菜单，不连带清掉选择（对标资源管理器：Esc 只关当前浮层）
+      // 先收浮层，不连带清掉选择（对标资源管理器：Esc 只关当前浮层）
+      if (reviewOpen.value) {
+        reviewOpen.value = false;
+        return;
+      }
+      if (searchOpen.value) {
+        closeSearch();
+        return;
+      }
       if (ctxOpen.value) {
         ctxOpen.value = false;
         return;
@@ -846,8 +984,11 @@ function onKeydown(e) {
       hoverRating.value = 0;
       return;
     default:
-      // 0 = 清除评分（与点同一颗星等价）
-      if (/^[0-5]$/.test(e.key)) {
+      // X = 标记/取消废片（对标 Lightroom 的 Reject）；0 = 清除评分
+      if (e.key.toLowerCase() === "x") {
+        e.preventDefault();
+        onToggleReject();
+      } else if (/^[0-5]$/.test(e.key)) {
         e.preventDefault();
         onRate(Number(e.key));
       }
@@ -864,10 +1005,12 @@ function openItem(item) {
   });
 }
 
-// ── 网格右键菜单（只负责「把文件交给哪个程序」，不改文件）─────────────────
+// ── 网格右键菜单（自绘，不引入系统 Shell 菜单；见 docs §16）────────────────
+// 当前只提供「交给哪个程序」+「标记废片」，不直接删 / 改名 —— 这是实现状态，
+// 不是原则禁令：§16 起图库阶段允许文件管理操作，将来可在此自绘菜单里加。
 // 与「查看」菜单同套路：Teleport 到 body + fixed，避免被 overflow-y-auto / 虚拟行 transform 裁切。
 const CTX_W = 200;
-const CTX_H = 144; // 头部 + 分隔线 + 3 项 + 分隔线 + padding，用于右下越界夹取
+const CTX_H = 176; // 头部 + 分隔线 + 4 项 + 两道分隔线 + padding，用于右下越界夹取
 const MAX_CTX_OPEN = 20; // Ctrl+A 全选后误点「打开」会拉起上万进程，必须兜住
 const ctxOpen = ref(false);
 const ctxPos = ref({ top: 0, left: 0 });
@@ -944,6 +1087,25 @@ function ctxOpenFolder() {
   invoke("open_in_explorer", { path: item.path }).catch((e) => {
     openError.value = errMsg(e);
   });
+}
+
+/** 菜单项声明（渲染交给 PhotoMenu，动作仍在这里） */
+const ctxMenuItems = computed(() => {
+  const n = ctxItems.value.length;
+  const hint = n > 1 ? `${n} 项` : "";
+  return [
+    { key: "open", label: "打开", icon: ExternalLink, hint, disabled: ctxTooMany.value },
+    { key: "photoshop", label: "使用 Photoshop 打开", icon: WandSparkles, hint, disabled: ctxTooMany.value },
+    // 标记是零风险可逆动作，不受 MAX_CTX_OPEN 限制（那条只挡「拉起外部程序」）
+    { key: "reject", label: "标记废片（X）", icon: Ban, hint, separatorBefore: true },
+    { key: "folder", label: "打开所在文件夹", icon: FolderOpen, separatorBefore: true },
+  ];
+});
+function onCtxPick(key) {
+  if (key === "open") ctxOpenDefault();
+  else if (key === "photoshop") ctxOpenPhotoshop();
+  else if (key === "reject") ctxToggleReject();
+  else if (key === "folder") ctxOpenFolder();
 }
 
 // ── 时间补齐完成时的重排 ─────────────────────────────────────────────────
@@ -1081,6 +1243,116 @@ function onHeartClick(item, e) {
   onToggleFavorite([item.path]);
 }
 
+// ── 废片标记与复核清单（docs §15）───────────────────────────────────────
+// 两段式：看片时按 X 只写 `rejects` 表（零风险、可逆）；删除是之后在清单里
+// 逐项勾选 + 二次确认 + 移入系统回收站。绝不自动删、绝不碰 SD 卡。
+const rejectBusy = ref(false);
+const rejectError = ref(null);
+
+async function setRejected(paths, value) {
+  if (!paths.length || rejectBusy.value) return;
+  rejectBusy.value = true;
+  rejectError.value = null;
+  try {
+    await invoke("gallery_set_rejected", { paths, rejected: value });
+    const set = new Set(paths);
+    for (const it of store.gallery.items) {
+      if (set.has(it.path)) it.rejected = value;
+    }
+    // 标记后目标可能立刻从 displayItems 消失，watch(displayItems) 会收敛选区
+  } catch (e) {
+    rejectError.value = errMsg(e); // DB 写失败如实显示，绝不假装已标记
+  } finally {
+    rejectBusy.value = false;
+  }
+}
+
+/** 常规视图里都是未标记项 → 标记；复核清单传的是已标记项 → 取消标记 */
+function onToggleReject(paths = null) {
+  const targets = paths ?? rateTargets.value;
+  if (!targets.length) return;
+  const byPath = new Map(store.gallery.items.map((it) => [it.path, it]));
+  const all = targets.every((p) => byPath.get(p)?.rejected);
+  setRejected(targets, !all);
+}
+
+function ctxToggleReject() {
+  const paths = ctxItems.value.map((it) => it.path);
+  ctxOpen.value = false;
+  onToggleReject(paths);
+}
+
+// ── 复核清单：当前唯一能查看 / 取消标记 / 删除废片的入口（docs §16）───────
+const reviewOpen = ref(false);
+const reviewChecked = ref(new Set()); // 默认全不勾，避免误删
+const reviewBusy = ref(false);
+const reviewError = ref(null);
+const reviewResult = ref(null);
+
+function openReview() {
+  reviewOpen.value = true;
+  reviewChecked.value = new Set();
+  reviewError.value = null;
+  reviewResult.value = null;
+}
+
+function toggleReviewCheck(path) {
+  const next = new Set(reviewChecked.value);
+  if (next.has(path)) next.delete(path);
+  else next.add(path);
+  reviewChecked.value = next;
+}
+
+function reviewToggleAll() {
+  reviewChecked.value =
+    reviewChecked.value.size === rejectedItems.value.length
+      ? new Set()
+      : new Set(rejectedItems.value.map((it) => it.path));
+}
+
+async function unreject(path) {
+  await setRejected([path], false);
+  const next = new Set(reviewChecked.value);
+  next.delete(path);
+  reviewChecked.value = next;
+}
+
+const reviewSelectedItems = computed(() =>
+  rejectedItems.value.filter((it) => reviewChecked.value.has(it.path)),
+);
+const reviewBytes = computed(() =>
+  reviewSelectedItems.value.reduce((s, it) => s + it.size, 0),
+);
+
+async function doDeleteRejected() {
+  const items = reviewSelectedItems.value;
+  if (!items.length || reviewBusy.value) return;
+  const ok = await ask(
+    `将把这 ${items.length} 个文件移入系统回收站（合计 ${formatBytes(reviewBytes.value)}），可在回收站还原，不会永久删除。\n\n注意：SD 卡若未清空，下次插卡扫描这些文件可能被当成新增重新拷回。继续？`,
+    { title: "清理废片", kind: "warning", okLabel: "移入回收站", cancelLabel: "取消" },
+  );
+  if (!ok) return;
+  reviewBusy.value = true;
+  reviewError.value = null;
+  reviewResult.value = null;
+  try {
+    const report = await invoke("gallery_delete_rejected", {
+      paths: items.map((it) => it.path),
+    });
+    reviewResult.value = report;
+    // 先本地移除成功项，不等 watcher 的 2s 防抖；失败项保持原样，可重试
+    const gone = new Set(report.deleted);
+    store.gallery.items = store.gallery.items.filter((it) => !gone.has(it.path));
+    reviewChecked.value = new Set();
+    selected.value = new Set();
+    await loadGallery().catch(() => {});
+  } catch (e) {
+    reviewError.value = errMsg(e);
+  } finally {
+    reviewBusy.value = false;
+  }
+}
+
 // ── 展示辅助 ─────────────────────────────────────────────────────────────
 const totalSize = computed(() => displayItems.value.reduce((s, it) => s + it.size, 0));
 const timesProgress = computed(() => {
@@ -1187,7 +1459,7 @@ function relDir(item) {
                truncate 成省略号，不会出现半截字被硬裁；「N 项」与星级徽标刚性保留。
                工具条更窄时由 @container 直接隐藏（stat-secondary），把宽度全让给控件 -->
           <span v-if="kindFilter !== 'all' || ratingFilter !== 'all' || favoriteFilter" class="stat-secondary min-w-0 truncate text-xs text-ink-3" :class="{ 'is-narrow-hide': toolbarNarrow }">
-            / 共 {{ store.gallery.items.length.toLocaleString() }} 项
+            / 共 {{ normalItems.length.toLocaleString() }} 项
           </span>
           <div v-if="totalSize" class="stat-secondary flex min-w-0 shrink-[10] items-center gap-x-3 text-ink-2" :class="{ 'is-narrow-hide': toolbarNarrow }">
             <span class="shrink-0 text-ink-3">·</span>
@@ -1200,6 +1472,8 @@ function relDir(item) {
         </template>
         <span v-else class="shrink-0 whitespace-nowrap text-ink-2">图库</span>
         <span v-if="openError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="openError">{{ openError }}</span>
+        <!-- 标记写失败在网格里也要看得见（复核弹窗未打开时它是唯一出口） -->
+        <span v-if="rejectError" class="max-w-64 shrink-0 truncate text-xs text-bad" :title="rejectError">{{ rejectError }}</span>
       </div>
       <div v-if="store.gallery.items.length" class="flex shrink-0 items-center gap-1.5">
         <div class="flex h-7 items-center gap-0.5 rounded-lg bg-subtle p-0.5">
@@ -1278,6 +1552,21 @@ function relDir(item) {
           </button>
         </div>
 
+        <span class="h-4 w-px shrink-0 bg-line"></span>
+
+        <!-- 废片：只记标记、不改文件；点开复核清单才能取消标记或删除 -->
+        <button
+          class="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-xs transition-colors"
+          :class="rejectedItems.length ? 'text-bad hover:bg-bad-soft' : 'text-ink-2 hover:bg-hover'"
+          :title="rejectedItems.length ? `已标记 ${rejectedItems.length} 张废片（文件仍在库里），点开复核清单` : '还没有废片。看片时按 X 标记；标记只隐藏视图，不删除文件'"
+          aria-label="废片复核清单"
+          @click="openReview"
+        >
+          <Ban class="size-3.5" />
+          <span :class="{ 'is-narrow-hide': toolbarNarrow }">废片</span>
+          <span class="tabular-nums text-[10px]">{{ rejectedItems.length.toLocaleString() }}</span>
+        </button>
+
         <!-- 缩略图尺寸：离散 3 档；菜单 Teleport 到 body + fixed，按按钮 rect 定位 -->
         <div class="relative" data-view-menu>
           <button
@@ -1316,6 +1605,20 @@ function relDir(item) {
           </div>
         </Teleport>
       </div>
+      <!-- 文件名搜索：图标入口 + Teleport 浮层，只占 28px，不挤刚性筛选组 -->
+      <button
+        ref="searchBtn"
+        data-search-btn
+        class="grid size-7 shrink-0 place-items-center rounded-lg transition-colors"
+        :class="searchOpen ? 'bg-hover text-ink' : 'text-ink-2 hover:bg-hover'"
+        title="搜索文件名（回车跳到对应位置）"
+        aria-label="搜索文件名"
+        :aria-expanded="searchOpen"
+        @click="toggleSearch"
+      >
+        <Search class="size-4" />
+      </button>
+
       <!-- 信息栏开合 / 刷新：纯图标，省下约 70px 给筛选控件（含义走 title + aria-label） -->
       <button
         class="grid size-7 shrink-0 place-items-center rounded-lg transition-colors"
@@ -1354,6 +1657,10 @@ function relDir(item) {
         <div class="text-center">
           <p class="text-sm text-ink-2">当前筛选下没有文件</p>
           <p v-if="emptyHint" class="mt-1.5 text-xs text-ink-2">{{ emptyHint }}</p>
+          <p v-if="rejectedItems.length" class="mt-1.5 text-xs text-ink-3">
+            {{ rejectedItems.length }} 张废片已从视图隐藏（文件仍在库里）·
+            <button class="underline hover:text-ink" @click="openReview">去复核</button>
+          </p>
           <button
             class="mt-3 rounded-lg border border-line px-3 py-1.5 text-xs text-ink-2 transition-colors hover:bg-hover"
             @click="clearFilters"
@@ -1425,15 +1732,15 @@ function relDir(item) {
                       <component :is="item.kind === 'video' ? Film : FileImage" class="size-8" />
                     </div>
                     <!-- 左下角标：格式与评分并排，共用同一 overlay 底色。
-                         评分已放开到全格式，两个角标必须同容器，否则会叠在同一位置 -->
+                         格式对视频是 MP4/MOV、对 RAW 是「RAW」—— 同一语义同一位置（docs §32.2） -->
                     <div class="absolute bottom-1 left-1 flex items-center gap-1">
                       <span
-                        v-if="item.kind === 'video'"
+                        v-if="item.kind === 'video' || item.kind === 'raw'"
                         class="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white"
                         style="background-color: var(--badge-bg)"
                       >
-                        <Film class="size-3" />
-                        {{ item.ext.toUpperCase() }}
+                        <component :is="item.kind === 'video' ? Film : Aperture" class="size-3" />
+                        {{ item.kind === "video" ? item.ext.toUpperCase() : "RAW" }}
                       </span>
                       <span
                         v-if="item.rating"
@@ -1521,7 +1828,7 @@ function relDir(item) {
           <p class="text-xs leading-5 text-ink-2">选中一张照片或视频查看信息</p>
           <p v-if="displayItems.length" class="mt-3 text-[11px] leading-5 text-ink-2">
             方向键选择 · Shift 扩选 · Enter 打开<br />
-            空格收藏 · 0-5 打分 · Ctrl+A 全选 · Esc 取消
+            空格收藏 · 0-5 打分 · X 废片 · Ctrl+A 全选 · Esc 取消
           </p>
         </div>
       </div>
@@ -1633,6 +1940,19 @@ function relDir(item) {
               <dt class="mb-0.5 text-xs text-ink-2">修改时间</dt>
               <dd class="text-ink">{{ fmtDate(singleItem.mtimeSecs) }}</dd>
             </div>
+            <div v-if="photoLocation">
+              <dt class="mb-0.5 text-xs text-ink-2">拍摄地点 <span class="text-ink-3">· 点位地址</span></dt>
+              <dd
+                class="break-words text-ink"
+                title="来自该照片所属 GPS 点位（约 1km 网格）的逆地理编码结果，同点位照片共用"
+              >
+                {{ photoLocation.address || photoAdminText || "已定位" }}
+                <span class="block text-[11px] leading-4 text-ink-3">
+                  {{ photoAdminText || "未解析行政区划" }} ·
+                  {{ photoLocation.lat.toFixed(5) }}°, {{ photoLocation.lon.toFixed(5) }}°
+                </span>
+              </dd>
+            </div>
             <div>
               <dt class="mb-0.5 text-xs text-ink-2">位置</dt>
               <dd class="break-all text-ink-2">{{ relDir(singleItem) }}</dd>
@@ -1648,8 +1968,8 @@ function relDir(item) {
           <p class="mb-2 text-center text-[11px] leading-4 text-ink-3">
             {{
               singleItem
-                ? "0-5 打分 · 空格收藏 · Enter 打开 · Esc 取消"
-                : "0-5 批量打分 · 空格收藏 · Esc 取消"
+                ? "0-5 打分 · 空格收藏 · X 废片 · Esc 取消"
+                : "0-5 批量打分 · 空格收藏 · X 废片 · Esc 取消"
             }}
           </p>
           <button
@@ -1664,47 +1984,157 @@ function relDir(item) {
       </template>
     </aside>
 
-    <!-- 网格右键菜单：Teleport 到 body + fixed，不受网格滚动与虚拟行 transform 裁切 -->
+    <!-- 网格右键菜单：与智能相册共用 PhotoMenu（docs §33），Teleport + fixed 不受滚动裁切 -->
+    <PhotoMenu
+      :open="ctxOpen"
+      :pos="ctxPos"
+      :title="ctxTooMany ? `一次最多打开 ${MAX_CTX_OPEN} 项` : ctxTitle"
+      :items="ctxMenuItems"
+      @pick="onCtxPick"
+    />
+
+    <!-- 文件名搜索浮层：与「查看」菜单同套路，不受工具条 overflow-x 裁切 -->
     <Teleport to="body">
       <div
-        v-if="ctxOpen"
-        class="fixed z-50 rounded-card border border-line bg-surface p-1 shadow-card"
-        :style="{ top: ctxPos.top + 'px', left: ctxPos.left + 'px', width: CTX_W + 'px' }"
-        data-ctx-menu
-        @contextmenu.prevent
+        v-if="searchOpen"
+        class="fixed z-50 rounded-card border border-line bg-surface p-2 shadow-card"
+        :style="{ top: searchPos.top + 'px', left: searchPos.left + 'px', width: SEARCH_W + 'px' }"
+        data-search-panel
       >
-        <div class="truncate px-2.5 py-1 text-[11px] text-ink-3" :title="ctxTitle">
-          {{ ctxTooMany ? `一次最多打开 ${MAX_CTX_OPEN} 项` : ctxTitle }}
+        <div class="flex items-center gap-2 rounded-lg bg-subtle px-2">
+          <Search class="size-3.5 shrink-0 text-ink-3" />
+          <input
+            ref="searchInput"
+            v-model="searchQuery"
+            type="text"
+            placeholder="输入文件名，回车跳转"
+            class="h-8 min-w-0 flex-1 bg-transparent text-xs text-ink outline-none placeholder:text-ink-3"
+            @keydown="onSearchKeydown"
+          />
+          <button
+            v-if="searchQuery"
+            class="grid size-5 shrink-0 place-items-center rounded text-ink-3 transition-colors hover:text-ink"
+            aria-label="清空搜索"
+            @click="searchQuery = ''"
+          >
+            <X class="size-3" />
+          </button>
         </div>
-        <div class="my-1 h-px bg-line"></div>
-        <button
-          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors"
-          :class="ctxTooMany ? 'cursor-not-allowed opacity-45' : 'hover:bg-hover'"
-          :disabled="ctxTooMany"
-          @click="ctxOpenDefault"
-        >
-          <ExternalLink class="size-3.5 shrink-0" />
-          <span>打开</span>
-          <span v-if="ctxItems.length > 1" class="ml-auto text-[10px] text-ink-3">{{ ctxItems.length }} 项</span>
-        </button>
-        <button
-          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors"
-          :class="ctxTooMany ? 'cursor-not-allowed opacity-45' : 'hover:bg-hover'"
-          :disabled="ctxTooMany"
-          @click="ctxOpenPhotoshop"
-        >
-          <WandSparkles class="size-3.5 shrink-0" />
-          <span>使用 Photoshop 打开</span>
-          <span v-if="ctxItems.length > 1" class="ml-auto text-[10px] text-ink-3">{{ ctxItems.length }} 项</span>
-        </button>
-        <div class="my-1 h-px bg-line"></div>
-        <button
-          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-ink-2 transition-colors hover:bg-hover"
-          @click="ctxOpenFolder"
-        >
-          <FolderOpen class="size-3.5 shrink-0" />
-          <span>打开所在文件夹</span>
-        </button>
+        <div class="mt-2 flex items-center justify-between gap-2 px-1 text-[11px]">
+          <span :class="searchQuery && !searchMatches.length ? 'text-bad' : 'text-ink-3'">
+            {{
+              !searchQuery
+                ? "只搜当前视图的文件名"
+                : searchMatches.length
+                  ? searchIdx >= 0
+                    ? `第 ${searchIdx + 1} / ${searchMatches.length} 个`
+                    : `共 ${searchMatches.length} 个匹配`
+                  : "当前视图下无匹配"
+            }}
+          </span>
+          <div class="flex shrink-0 gap-1">
+            <button
+              class="rounded-md border border-line px-2 py-1 text-[11px] text-ink-2 transition-colors hover:bg-hover disabled:opacity-40"
+              :disabled="!searchMatches.length"
+              @click="jumpToMatch(-1)"
+            >上一个</button>
+            <button
+              class="rounded-md border border-line px-2 py-1 text-[11px] text-ink-2 transition-colors hover:bg-hover disabled:opacity-40"
+              :disabled="!searchMatches.length"
+              @click="jumpToMatch(1)"
+            >下一个</button>
+          </div>
+        </div>
+        <p v-if="searchQuery && !searchMatches.length" class="mt-1.5 px-1 text-[11px] leading-4 text-ink-3">
+          被筛选隐藏或标记为废片的文件不在搜索范围内；
+          <button class="underline hover:text-ink" @click="clearFilters(); openReview()">清除筛选并查看废片</button>
+        </p>
+      </div>
+    </Teleport>
+
+    <!-- 废片复核清单：唯一能查看 / 取消标记 / 删除废片的地方 -->
+    <Teleport to="body">
+      <div
+        v-if="reviewOpen"
+        class="fixed inset-0 z-50 grid place-items-center px-4"
+        style="background-color: rgb(46 42 36 / 0.30)"
+        @click.self="reviewOpen = false"
+        @keydown.esc.stop="reviewOpen = false"
+      >
+        <div class="flex max-h-[80vh] w-full max-w-xl flex-col overflow-hidden rounded-card border border-line bg-surface shadow-card">
+          <header class="flex items-start justify-between gap-3 border-b border-line px-5 py-3">
+            <div>
+              <h2 class="text-sm font-semibold">废片复核</h2>
+              <p class="mt-0.5 text-[11px] text-ink-3">标记只是隐藏视图，文件仍在库里；删除需勾选后二次确认</p>
+            </div>
+            <button
+              class="grid size-7 shrink-0 place-items-center rounded-lg text-ink-2 transition-colors hover:bg-hover"
+              aria-label="关闭"
+              @click="reviewOpen = false"
+            >
+              <X class="size-4" />
+            </button>
+          </header>
+
+          <div class="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+            <div v-if="!rejectedItems.length" class="py-12 text-center text-sm text-ink-2">还没有标记废片</div>
+            <template v-else>
+              <div class="mb-1 flex items-center justify-between px-2 text-xs text-ink-2">
+                <span>共 {{ rejectedItems.length }} 项</span>
+                <button class="hover:text-ink" @click="reviewToggleAll">
+                  {{ reviewChecked.size === rejectedItems.length ? "取消全选" : "全选" }}
+                </button>
+              </div>
+              <label
+                v-for="it in rejectedItems"
+                :key="it.path"
+                class="flex cursor-pointer items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-hover"
+              >
+                <input
+                  type="checkbox"
+                  class="size-3.5 shrink-0"
+                  style="accent-color: var(--color-amber)"
+                  :checked="reviewChecked.has(it.path)"
+                  @change="toggleReviewCheck(it.path)"
+                />
+                <img :src="thumbUrl(it.path)" class="size-10 shrink-0 rounded bg-subtle object-cover" alt="" draggable="false" />
+                <div class="min-w-0 flex-1">
+                  <div class="truncate text-xs font-medium" :title="it.name">{{ it.name }}</div>
+                  <div class="truncate text-[11px] text-ink-3" :title="it.path">{{ relDir(it) }} · {{ formatBytes(it.size) }}</div>
+                </div>
+                <button
+                  class="shrink-0 rounded-md border border-line px-2 py-1 text-[11px] text-ink-2 transition-colors hover:bg-hover"
+                  title="取消标记，恢复到正常视图（文件不会有任何改动）"
+                  @click.prevent="unreject(it.path)"
+                >还原</button>
+              </label>
+            </template>
+          </div>
+
+          <footer class="border-t border-line px-5 py-3">
+            <p v-if="rejectError" class="mb-2 text-xs text-bad">{{ rejectError }}</p>
+            <p v-if="reviewError" class="mb-2 text-xs text-bad">{{ reviewError }}</p>
+            <div v-if="reviewResult" class="mb-2 text-xs leading-5 text-ink-2">
+              已移入回收站 {{ reviewResult.deleted.length }} 项 · 失败 {{ reviewResult.failed.length }} 项（可在系统回收站还原）
+              <span v-if="reviewResult.cleanupWarning" class="block text-bad">{{ reviewResult.cleanupWarning }}</span>
+              <span v-for="f in reviewResult.failed.slice(0, 3)" :key="f.path" class="block text-bad">{{ f.path.split('\\').pop() }}：{{ f.reason }}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-xs text-ink-2">已选 {{ reviewChecked.size }} 项 · {{ formatBytes(reviewBytes) }}</span>
+              <div class="flex shrink-0 items-center gap-2">
+                <button class="rounded-lg border border-line px-3 py-1.5 text-xs text-ink-2 transition-colors hover:bg-hover" @click="reviewOpen = false">关闭</button>
+                <button
+                  class="flex items-center gap-1.5 rounded-lg bg-bad px-3 py-1.5 text-xs text-white transition-opacity disabled:opacity-40"
+                  :disabled="!reviewChecked.size || reviewBusy"
+                  @click="doDeleteRejected"
+                >
+                  <Trash2 class="size-3.5" />
+                  {{ reviewBusy ? "处理中…" : "移入回收站" }}
+                </button>
+              </div>
+            </div>
+          </footer>
+        </div>
       </div>
     </Teleport>
   </div>

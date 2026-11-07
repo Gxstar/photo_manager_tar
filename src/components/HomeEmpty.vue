@@ -27,7 +27,7 @@ const emptyLib = computed(
 );
 
 function thumbUrl(path) {
-  return `http://thumb.localhost/${encodeURIComponent(path)}`;
+  return `http://thumb.localhost/${encodeURIComponent(path)}?v=2`;
 }
 
 function onThumbError(path) {

@@ -330,7 +330,8 @@ fn renamed_file_in_library_is_skipped() {
     let _ = std::fs::remove_dir_all(&lib);
 }
 
-/// 判重（2026-11-05 简化后）：库内文件永不修改 → 只看「存在 + 字节数相等」。
+/// 判重（2026-11-05 简化后，docs §16 修订措辞）：库内文件不会被原地改写字节数
+/// → 只看「存在 + 字节数相等」；删除 / 改名只让目标路径消失，判为 New。
 /// 任何字节数不等（放大 / 缩小 / 残缺半截 / 其它格式）一律冲突，不再猜是不是编辑过。
 #[test]
 fn stat_target_sizes() {
@@ -604,4 +605,27 @@ fn format_bytes(n: u64) -> String {
     } else {
         format!("{:.1} MB", n as f64 / (1024 * 1024) as f64)
     }
+}
+
+/// 缩略图 URL 带 `?v=2` 用于击穿旧的 immutable 404 缓存。
+/// 必须确认协议层 `uri().path()` 不含 query，否则路径会被拼上 `?v=2` 而全部 404。
+#[test]
+fn thumb_protocol_path_excludes_query() {
+    let raw = "http://thumb.localhost/D%3A%5C%E5%AA%92%E4%BD%93%5C%E5%9B%BE%E7%89%87%5Ca.JPG?v=2";
+    let uri: tauri::http::Uri = raw.parse().expect("URI 可解析");
+    let path = uri.path().trim_start_matches('/');
+    assert!(!path.contains('?'), "path 不应包含 query: {path}");
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8_lossy()
+        .to_string();
+    assert_eq!(decoded, r"D:\媒体\图片\a.JPG");
+
+    // 真实媒体库路径是混合分隔符（根用 `/`、子目录用 `\`），
+    // 其中 `/` 被前端编码成 %2F，解码后必须原样保留，由 thumbs 边界再规范化。
+    let mixed = "http://thumb.localhost/D%3A%2F%E5%AA%92%E4%BD%93%2F%E5%9B%BE%E7%89%87%5Ca.JPG?v=2";
+    let uri2: tauri::http::Uri = mixed.parse().expect("URI 可解析");
+    let decoded2 = percent_encoding::percent_decode_str(uri2.path().trim_start_matches('/'))
+        .decode_utf8_lossy()
+        .to_string();
+    assert_eq!(decoded2, "D:/媒体/图片\\a.JPG");
 }

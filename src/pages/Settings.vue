@@ -3,10 +3,13 @@ import { computed, onMounted, ref } from "vue";
 // window.confirm 在该 WebView 返回 Promise（恒真），必须用原生对话框插件
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Copy, FolderOpen, FolderPen, HardDrive, FileStack, RotateCcw, TriangleAlert, WandSparkles } from "lucide-vue-next";
+import { Check, ChevronDown, Copy, FolderPen, RotateCcw, TriangleAlert } from "lucide-vue-next";
+import ModelSettings from "../components/ModelSettings.vue";
+import PlaceSettings from "../components/PlaceSettings.vue";
+import SettingGroup from "../components/SettingGroup.vue";
+import SettingRow from "../components/SettingRow.vue";
 import {
   store,
-  loadConfig,
   loadStats,
   errMsg,
   resetHome,
@@ -14,26 +17,38 @@ import {
   formatBytes,
 } from "../store.js";
 
+/*
+ * 按钮规格（全页唯一口径，改动请一起改，避免高度/内距漂移）：
+ *   主按钮  h-8 + px-3 + text-xs + amber
+ *   次按钮  h-8 + px-3 + text-xs + 描边
+ *   图标钮  size-8 + 描边
+ *   危险钮  h-8 + px-3 + text-xs + bad 描边
+ */
+
 const saving = ref(false);
 const error = ref(null);
-const behaviorError = ref(null);
+const scanError = ref(null);
+const clearError = ref(null);
 
-// 复制路径 / 已保存：都给一次短反馈，避免"点了没反应"
+// 复制路径：给一次短反馈，避免"点了没反应"
 const copied = ref(false);
 let copiedTimer = 0;
 const savedFlash = ref(false);
 let savedTimer = 0;
+const dbCopied = ref(false);
+let dbCopiedTimer = 0;
 
 async function copyRoot() {
   const root = store.config?.libraryRoot;
   if (!root) return;
   try {
     await navigator.clipboard.writeText(root);
+    error.value = null;
     copied.value = true;
     clearTimeout(copiedTimer);
     copiedTimer = setTimeout(() => (copied.value = false), 1600);
   } catch {
-    error.value = "复制失败，可双击路径手动选中";
+    error.value = "复制失败，可直接选中路径文字手动复制";
   }
 }
 
@@ -48,6 +63,19 @@ const interopError = ref(null);
 const interopMsg = ref(null);
 const dbPath = ref("");
 
+async function copyDbPath() {
+  if (!dbPath.value) return;
+  try {
+    await navigator.clipboard.writeText(dbPath.value);
+    interopError.value = null;
+    dbCopied.value = true;
+    clearTimeout(dbCopiedTimer);
+    dbCopiedTimer = setTimeout(() => (dbCopied.value = false), 1600);
+  } catch {
+    interopError.value = "复制失败，请手动选中路径";
+  }
+}
+
 // ── 外部编辑器（图库网格右键「使用 Photoshop 打开」）─────────────────────
 const editorError = ref(null);
 const editorBusy = ref(false);
@@ -57,6 +85,13 @@ const detectedExe = ref("");
 
 const configuredExe = computed(() => store.config?.photoshopPath || "");
 const effectiveExe = computed(() => configuredExe.value || detectedExe.value);
+
+// 路径放行描述位（一行），因此「自动检测」这类补充说明并进同一句
+const editorDesc = computed(() => {
+  if (configuredExe.value) return configuredExe.value;
+  if (detectedExe.value) return `${detectedExe.value} · 自动检测`;
+  return "未找到 Photoshop.exe，可手动指定一次";
+});
 
 async function refreshDetected() {
   try {
@@ -112,7 +147,7 @@ async function importRatings() {
   interopMsg.value = null;
   try {
     const r = await invoke("ratings_import_from_files");
-    interopMsg.value = `导入 ${r.imported} 项 · 已有评分跳过 ${r.skippedExisting} 项 · 文件里无评分 ${r.noRating} 项 · 无法读取 ${r.unreadable} 项（厂商 RAW / 视频等不读内嵌 XMP，属预期）`;
+    interopMsg.value = `已导入 ${r.imported} 项 · 已有评分跳过 ${r.skippedExisting} 项 · 文件里无评分 ${r.noRating} 项 · 无法读取 ${r.unreadable} 项（厂商 RAW / 视频不读内嵌 XMP，属预期）`;
     loadGallery().catch(() => {}); // 让图库切回来时角标与筛选立刻反映新值
   } catch (e) {
     interopError.value = errMsg(e);
@@ -151,28 +186,28 @@ async function clearLog() {
   });
   if (!ok) return;
   clearing.value = true;
-  behaviorError.value = null;
+  clearError.value = null;
   clearedMsg.value = null;
   try {
     const n = await invoke("import_log_clear");
     clearedMsg.value = `已清空 ${n} 条记录`;
     resetHome(); // 首页的记录列表需要重取
   } catch (e) {
-    behaviorError.value = errMsg(e);
+    clearError.value = errMsg(e);
   } finally {
     clearing.value = false;
   }
 }
 
 async function toggleAutoScan() {
-  behaviorError.value = null;
+  scanError.value = null;
   try {
     store.config = await invoke("set_auto_scan", { enabled: !autoScan.value });
     savedFlash.value = true;
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => (savedFlash.value = false), 1600);
   } catch (e) {
-    behaviorError.value = errMsg(e);
+    scanError.value = errMsg(e);
   }
 }
 
@@ -203,25 +238,13 @@ async function saveRoot(dir) {
 </script>
 
 <template>
-  <div class="mx-auto max-w-2xl space-y-4 p-6">
-    <!-- 媒体库路径 -->
-    <section class="rounded-card border border-line bg-surface p-5 shadow-card">
-      <h2 class="mb-1 text-sm font-semibold">媒体库位置</h2>
-      <p class="mb-3 text-xs text-ink-2">
-        照片与视频将按拍摄月份归档到该目录下的「原图 / 视频」文件夹
-      </p>
-      <div class="flex items-center gap-2">
-        <div
-          class="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-subtle px-3 text-sm"
-        >
-          <FolderOpen class="size-4 shrink-0 text-ink-3" />
-          <span class="truncate" :title="store.config?.libraryRoot">
-            {{ store.config?.libraryRoot || "未设置" }}
-          </span>
-        </div>
-        <!-- 路径框不可编辑：给它一个明确的"复制"出口，而不是让用户对着假输入框点 -->
+  <div class="mx-auto max-w-3xl space-y-7 px-6 py-6">
+    <!-- 媒体库：全局存储基础，不属于某个功能页 -->
+    <SettingGroup label="媒体库">
+      <SettingRow title="媒体库位置" truncate :desc="store.config?.libraryRoot || '未设置'">
+        <!-- 路径不可编辑：给一个明确的"复制"出口，而不是让用户对着假输入框点 -->
         <button
-          class="grid size-9 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
+          class="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
           :disabled="!store.config?.libraryRoot"
           :title="copied ? '已复制' : '复制路径'"
           @click="copyRoot"
@@ -230,64 +253,35 @@ async function saveRoot(dir) {
           <Copy v-else class="size-4" />
         </button>
         <button
-          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
+          class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3 text-xs font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
           :disabled="saving"
           @click="pickLibraryRoot"
         >
-          <FolderPen class="size-4" />
+          <FolderPen class="size-3.5" />
           更改
         </button>
-      </div>
-      <p v-if="error" class="mt-2 flex items-center gap-1 text-xs text-bad">
-        <TriangleAlert class="size-3.5" /> {{ error }}
+      </SettingRow>
+
+      <SettingRow
+        v-if="store.stats"
+        title="库占用"
+        :desc="`${store.stats.totalFiles.toLocaleString()} 个文件 · ${formatBytes(store.stats.totalBytes)}（与图库一致）`"
+      >
+        <span class="text-xs tabular-nums text-ink-2">剩余 {{ formatBytes(store.stats.freeBytes) }}</span>
+      </SettingRow>
+
+      <p v-if="error" class="flex items-center gap-1.5 bg-bad-soft px-5 py-2.5 text-xs text-bad">
+        <TriangleAlert class="size-3.5 shrink-0" /> {{ error }}
       </p>
-    </section>
+    </SettingGroup>
 
-    <!-- 库统计 -->
-    <section
-      v-if="store.stats"
-      class="grid grid-cols-3 gap-3"
-    >
-      <div class="rounded-card border border-line bg-surface p-4 shadow-card">
-        <div class="flex items-center gap-2 text-xs text-ink-2">
-          <FileStack class="size-4 text-ink-3" /> 媒体文件
-        </div>
-        <div class="mt-1.5 text-xl font-semibold tabular-nums">
-          {{ store.stats.totalFiles.toLocaleString() }}
-        </div>
-        <div class="mt-0.5 text-[11px] text-ink-3">原图 + 视频，与图库项数一致</div>
-      </div>
-      <div class="rounded-card border border-line bg-surface p-4 shadow-card">
-        <div class="flex items-center gap-2 text-xs text-ink-2">
-          <HardDrive class="size-4 text-ink-3" /> 已占用
-        </div>
-        <div class="mt-1.5 text-xl font-semibold tabular-nums">
-          {{ formatBytes(store.stats.totalBytes) }}
-        </div>
-      </div>
-      <div class="rounded-card border border-line bg-surface p-4 shadow-card">
-        <div class="flex items-center gap-2 text-xs text-ink-2">
-          <HardDrive class="size-4 text-ink-3" /> 剩余空间
-        </div>
-        <div class="mt-1.5 text-xl font-semibold tabular-nums">
-          {{ formatBytes(store.stats.freeBytes) }}
-        </div>
-      </div>
-    </section>
-
-    <!-- 行为 -->
-    <section class="rounded-card border border-line bg-surface p-5 shadow-card">
-      <h2 class="mb-3 text-sm font-semibold">行为</h2>
-      <div class="flex items-center justify-between gap-4">
-        <div class="min-w-0">
-          <div class="flex items-center gap-1.5 text-sm">
-            插卡后自动扫描
-            <span v-if="savedFlash" class="text-[11px] font-normal text-ok">已保存</span>
-          </div>
-          <p class="mt-0.5 text-xs leading-relaxed text-ink-2">
-            检测到相机卡后自动生成归档计划。扫描只读卡、不改卡，仍需手动点「开始拷贝」
-          </p>
-        </div>
+    <!-- 导入与归档：对应「拷贝整理」页的全部行为 -->
+    <SettingGroup label="导入与归档">
+      <SettingRow desc="检测到相机卡即生成归档计划；只读卡、不改卡，仍需手动点「开始拷贝」">
+        <template #title>
+          插卡后自动扫描
+          <span v-if="savedFlash" class="text-[11px] font-normal text-ok">已保存</span>
+        </template>
         <button
           role="switch"
           :aria-checked="autoScan ? 'true' : 'false'"
@@ -301,57 +295,63 @@ async function saveRoot(dir) {
             :style="{ left: autoScan ? '22px' : '2px' }"
           />
         </button>
-      </div>
-      <p v-if="behaviorError" class="mt-2 flex items-center gap-1 text-xs text-bad">
-        <TriangleAlert class="size-3.5" /> {{ behaviorError }}
-      </p>
+      </SettingRow>
 
-      <div class="mt-4 flex items-center justify-between gap-4 border-t border-line pt-4">
-        <div class="min-w-0">
-          <div class="text-sm">导入记录</div>
-          <p class="mt-0.5 text-xs leading-relaxed text-ink-2">
-            每次拷贝结束自动记录一条（含失败明细与取消），无卡首页展示最近 5 条
-            <span v-if="clearedMsg" class="text-ink-3">· {{ clearedMsg }}</span>
-          </p>
-        </div>
+      <!-- 静态说明不占常驻高度，折叠起来 -->
+      <details class="group">
+        <summary
+          class="flex cursor-pointer list-none items-center gap-4 px-5 py-3.5 text-[13px] font-medium text-ink transition-colors hover:bg-hover/60"
+        >
+          <span class="flex-1">归档与去重规则</span>
+          <ChevronDown class="chev size-4 text-ink-3 transition-transform duration-150" />
+        </summary>
+        <ul class="space-y-1.5 px-5 pb-4 text-xs leading-relaxed text-ink-2">
+          <li>· 保持相机原厂文件名，不做任何改名</li>
+          <li>· 照片 / RAW → <code class="rounded bg-subtle px-1">原图\年份\年-月\</code>；视频 → <code class="rounded bg-subtle px-1">视频\年份\年-月\</code></li>
+          <li>· 无法确定拍摄时间的文件 → <code class="rounded bg-subtle px-1">原图\待定\</code></li>
+          <li>· 同名同大小视为已存在、自动跳过；同名不同大小标为冲突，绝不覆盖</li>
+          <li>· 拷贝阶段只新增文件，不改动或删除媒体库中已有内容</li>
+        </ul>
+      </details>
+
+      <SettingRow title="清空导入记录" desc="每次拷贝结束自动记一条（含失败明细与取消），无卡首页展示最近 5 条">
         <button
-          class="h-8 shrink-0 rounded-lg border border-bad/40 px-3 text-xs text-bad transition-colors hover:bg-bad-soft disabled:opacity-55"
+          class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-bad/40 px-3 text-xs text-bad transition-colors hover:bg-bad-soft disabled:opacity-55"
           :disabled="clearing"
           @click="clearLog"
         >
           清空记录
         </button>
-      </div>
-    </section>
+      </SettingRow>
 
-    <!-- 外部编辑器 -->
-    <section class="rounded-card border border-line bg-surface p-5 shadow-card">
-      <h2 class="mb-1 flex items-center gap-1.5 text-sm font-semibold">
-        外部编辑器
-        <span v-if="editorSaved" class="text-[11px] font-normal text-ok">已保存</span>
-      </h2>
-      <p class="mb-3 text-xs leading-relaxed text-ink-2">
-        图库网格右键「使用 Photoshop 打开」会启动此程序。留空时自动查找 Adobe 安装目录；
-        装在非默认盘或绿色版请手动指定一次。
+      <p v-if="scanError" class="flex items-center gap-1.5 bg-bad-soft px-5 py-2.5 text-xs text-bad">
+        <TriangleAlert class="size-3.5 shrink-0" /> {{ scanError }}
       </p>
-      <div class="flex items-center gap-2">
-        <div class="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-subtle px-3 text-sm">
-          <WandSparkles class="size-4 shrink-0 text-ink-3" />
-          <span class="truncate" :title="effectiveExe || '未找到'">
-            {{ effectiveExe || "未找到 Photoshop.exe" }}
-          </span>
-          <span v-if="!configuredExe && effectiveExe" class="shrink-0 text-[11px] text-ink-3">自动</span>
-        </div>
+      <p v-if="clearedMsg" class="flex items-center gap-1.5 bg-ok-soft px-5 py-2.5 text-xs text-ok">
+        <Check class="size-3.5 shrink-0" /> {{ clearedMsg }}
+      </p>
+      <p v-if="clearError" class="flex items-center gap-1.5 bg-bad-soft px-5 py-2.5 text-xs text-bad">
+        <TriangleAlert class="size-3.5 shrink-0" /> {{ clearError }}
+      </p>
+    </SettingGroup>
+
+    <!-- 图库：打开方式与评分互操作 -->
+    <SettingGroup label="图库">
+      <SettingRow truncate :desc="editorDesc">
+        <template #title>
+          外部编辑器
+          <span v-if="editorSaved" class="text-[11px] font-normal text-ok">已保存</span>
+        </template>
         <button
-          class="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
+          class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-amber px-3 text-xs font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
           :disabled="editorBusy"
           @click="pickPhotoshop"
         >
-          <FolderPen class="size-4" />
+          <FolderPen class="size-3.5" />
           选择
         </button>
         <button
-          class="grid size-9 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
+          class="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
           :disabled="editorBusy || !configuredExe"
           title="恢复自动查找"
           aria-label="恢复自动查找"
@@ -359,68 +359,67 @@ async function saveRoot(dir) {
         >
           <RotateCcw class="size-4" />
         </button>
-      </div>
-      <p v-if="editorError" class="mt-2 flex items-center gap-1 text-xs text-bad">
-        <TriangleAlert class="size-3.5" /> {{ editorError }}
-      </p>
-    </section>
+      </SettingRow>
 
-    <!-- 评分与互操作 -->
-    <section class="rounded-card border border-line bg-surface p-5 shadow-card">
-      <h2 class="mb-1 text-sm font-semibold">评分与互操作</h2>
-      <p class="mb-4 text-xs leading-relaxed text-ink-2">
-        评分保存在本地数据库，永不修改照片文件。媒体库里的原图保持只读，编辑请另存副本。
-      </p>
-      <div class="flex items-center justify-between gap-4">
-        <div class="min-w-0">
-          <div class="text-sm">从文件导入旧评分</div>
-          <p class="mt-0.5 text-xs leading-relaxed text-ink-2">
-            一次性读取 JPEG / AVIF·HEIC 内嵌 XMP，只填补本地还没有评分的文件
-          </p>
-        </div>
+      <SettingRow title="从照片文件导入旧评分" desc="读取 JPEG / AVIF·HEIC 内嵌 XMP，只补空缺、不覆盖已打的分">
         <button
-          class="h-8 shrink-0 rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover disabled:opacity-55"
+          class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
           :disabled="interopBusy"
           @click="importRatings"
         >
           导入
         </button>
-      </div>
-      <div class="mt-4 flex items-center justify-between gap-4 border-t border-line pt-4">
-        <div class="min-w-0">
-          <div class="text-sm">导出评分到 XMP sidecar</div>
-          <p class="mt-0.5 text-xs leading-relaxed text-ink-2">
-            给 Bridge / Lightroom / darktable / XnView 等软件读取；默认不生成，第三方 sidecar 一律跳过
-          </p>
-        </div>
+      </SettingRow>
+
+      <SettingRow title="导出评分到 XMP" desc="供 Bridge / Lightroom / darktable 读取；第三方 sidecar 一律跳过、绝不覆盖">
         <button
-          class="h-8 shrink-0 rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover disabled:opacity-55"
+          class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-line px-3 text-xs text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
           :disabled="interopBusy"
           @click="exportSidecars"
         >
           导出
         </button>
-      </div>
-      <p v-if="interopMsg" class="mt-3 text-xs leading-5 text-ink-2">{{ interopMsg }}</p>
-      <p v-if="interopError" class="mt-2 flex items-center gap-1 text-xs text-bad">
-        <TriangleAlert class="size-3.5" /> {{ interopError }}
-      </p>
-      <p class="mt-3 border-t border-line pt-3 text-xs leading-5 text-ink-2">
-        评分数据库：<span class="break-all">{{ dbPath || "—" }}</span>（换电脑 / 重装前请备份此文件）。
-        Windows 资源管理器不读 sidecar，其「分级」列不会显示——这是保持原图只读的取舍。
-      </p>
-    </section>
+      </SettingRow>
 
-    <!-- 归档规则说明 -->
-    <section class="rounded-card border border-line bg-surface p-5 text-sm shadow-card">
-      <h2 class="mb-2 text-sm font-semibold">归档规则</h2>
-      <ul class="space-y-1.5 text-xs leading-relaxed text-ink-2">
-        <li>· 文件保持相机原厂文件名，不做任何改名</li>
-        <li>· 照片 / RAW → <code class="rounded bg-subtle px-1">原图\年份\年-月\</code>；视频 → <code class="rounded bg-subtle px-1">视频\年份\年-月\</code></li>
-        <li>· 无法确定拍摄时间的文件 → <code class="rounded bg-subtle px-1">原图\待定\</code></li>
-        <li>· 同名同大小的文件视为已存在，自动跳过；同名不同大小标为冲突，绝不覆盖</li>
-        <li>· 拷贝只新增文件，永不修改或删除媒体库中已有内容</li>
-      </ul>
-    </section>
+      <SettingRow title="评分数据库" truncate :desc="dbPath || '—'">
+        <button
+          class="grid size-8 shrink-0 place-items-center rounded-lg border border-line text-ink-2 transition-colors hover:bg-hover disabled:opacity-45"
+          :disabled="!dbPath"
+          :title="dbCopied ? '已复制' : '复制数据库路径'"
+          @click="copyDbPath"
+        >
+          <Check v-if="dbCopied" class="size-4 text-ok" />
+          <Copy v-else class="size-4" />
+        </button>
+      </SettingRow>
+
+      <p
+        v-if="interopMsg"
+        class="flex items-start gap-1.5 bg-ok-soft px-5 py-2.5 text-[11px] leading-relaxed text-ok"
+      >
+        <Check class="mt-0.5 size-3.5 shrink-0" /> {{ interopMsg }}
+      </p>
+      <p v-if="interopError" class="flex items-center gap-1.5 bg-bad-soft px-5 py-2.5 text-xs text-bad">
+        <TriangleAlert class="size-3.5 shrink-0" /> {{ interopError }}
+      </p>
+
+      <p class="px-5 py-2.5 text-[11px] leading-relaxed text-ink-3">
+        评分只存本地数据库、不写回照片文件；Windows 资源管理器不读 sidecar，其「分级」列不会显示。
+        换电脑或重装前请备份上方数据库文件。
+      </p>
+    </SettingGroup>
+
+    <!-- 智能相册：模型与在线地点服务 -->
+    <SettingGroup label="智能相册">
+      <ModelSettings />
+      <PlaceSettings />
+    </SettingGroup>
   </div>
 </template>
+
+<style scoped>
+/* details 展开时箭头转向（Tailwind 的 group-open 在本项目版本下不够稳，直接写） */
+details[open] .chev {
+  transform: rotate(180deg);
+}
+</style>

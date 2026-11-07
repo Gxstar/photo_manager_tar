@@ -4,6 +4,9 @@
 //! - `meta_cache`：拍摄时间缓存（path → mtime/shoot_time），**可重建**，删了会重扫。
 //! - `ratings`：评分**权威源**（path → 1-5），用户数据，删了不可恢复。
 //!   无评分 = 无行，清除评分 = DELETE；绝不写回图片文件。
+//! - `favorites` / `rejects`：收藏与废片标记（path 存在即已标记），同属用户数据。
+//!   `rejects` **只是标记**，文件仍原样留在库里；清理动作由 `gallery_delete_rejected`
+//!   在列清单二次确认后执行，删除成功后用 `forget_paths` 清掉四张表的孤儿行。
 //! - `import_log` / `import_failure`：每次拷贝的汇总与失败明细。
 //!
 //! 旧库文件的 `meta_cache.rating` 列保留但忽略（nullable，INSERT 不指定即可），
@@ -48,6 +51,10 @@ impl MetaStore {
                         updated_at TEXT NOT NULL
                     ) WITHOUT ROWID;
                     CREATE TABLE IF NOT EXISTS favorites (
+                        path       TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL
+                    ) WITHOUT ROWID;
+                    CREATE TABLE IF NOT EXISTS rejects (
                         path       TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL
                     ) WITHOUT ROWID;
@@ -274,6 +281,91 @@ impl MetaStore {
         Ok(n)
     }
 
+    // ── 废片标记（rejects）──────────────────────────────────────────────
+    // 只记标记，**不代表文件已删除**；移除文件由 gallery_delete_rejected
+    // 在「列清单 + 二次确认」后单独执行，两者刻意分开。
+
+    /// 废片集合：path 存在即已标记
+    pub fn all_rejects(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let Some(conn) = &self.conn else { return out };
+        let Ok(db) = conn.lock() else { return out };
+        let Ok(mut stmt) = db.prepare("SELECT path FROM rejects") else {
+            return out;
+        };
+        let _ = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                for p in rows.flatten() {
+                    out.insert(p);
+                }
+            });
+        out
+    }
+
+    /// 批量标记 / 取消标记（单事务）。DB 不可用或写失败一律 Err，不静默成功。
+    pub fn set_rejects_batch(&self, paths: &[String], rejected: bool) -> Result<usize, String> {
+        let Some(conn) = &self.conn else {
+            return Err("评分数据库不可用，废片标记未保存".into());
+        };
+        let mut db = conn
+            .lock()
+            .map_err(|_| "评分数据库被占用，废片标记未保存".to_string())?;
+        let tx = db
+            .transaction()
+            .map_err(|e| format!("废片标记保存失败: {e}"))?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let n = if rejected {
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO rejects (path, created_at) VALUES (?1, ?2)")
+                .map_err(|e| format!("废片标记保存失败: {e}"))?;
+            let mut n = 0;
+            for p in paths {
+                n += stmt
+                    .execute(rusqlite::params![p, now])
+                    .map_err(|e| format!("废片标记保存失败: {e}"))?;
+            }
+            n
+        } else {
+            let mut stmt = tx
+                .prepare_cached("DELETE FROM rejects WHERE path = ?1")
+                .map_err(|e| format!("废片标记保存失败: {e}"))?;
+            let mut n = 0;
+            for p in paths {
+                n += stmt
+                    .execute(rusqlite::params![p])
+                    .map_err(|e| format!("废片标记保存失败: {e}"))?;
+            }
+            n
+        };
+        tx.commit().map_err(|e| format!("废片标记保存失败: {e}"))?;
+        Ok(n)
+    }
+
+    /// 文件移入回收站后清掉它的评分 / 收藏 / 废片标记 / 时间缓存，
+    /// 避免以 path 为主键的四张表留下孤儿行。只对已确认删除的路径执行。
+    pub fn forget_paths(&self, paths: &[String]) -> Result<(), String> {
+        let Some(conn) = &self.conn else {
+            return Err("评分数据库不可用，删除后的标记清理未完成".into());
+        };
+        let mut db = conn
+            .lock()
+            .map_err(|_| "评分数据库被占用，删除后的标记清理未完成".to_string())?;
+        let tx = db.transaction().map_err(|e| format!("标记清理失败: {e}"))?;
+        for table in ["ratings", "favorites", "rejects", "meta_cache"] {
+            let sql = format!("DELETE FROM {table} WHERE path = ?1");
+            let mut stmt = tx
+                .prepare_cached(&sql)
+                .map_err(|e| format!("标记清理失败: {e}"))?;
+            for p in paths {
+                stmt.execute(rusqlite::params![p])
+                    .map_err(|e| format!("标记清理失败: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("标记清理失败: {e}"))?;
+        Ok(())
+    }
+
     /// 一次性从文件内嵌 XMP 导入评分：只插不覆盖（用户已在本工具打的分优先）
     pub fn insert_ratings(&self, entries: &[(String, u8)]) -> Result<usize, String> {
         let Some(conn) = &self.conn else {
@@ -434,6 +526,9 @@ mod tests {
             CREATE TABLE IF NOT EXISTS favorites (
                 path TEXT PRIMARY KEY, created_at TEXT NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS rejects (
+                path TEXT PRIMARY KEY, created_at TEXT NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS import_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, finished_at TEXT NOT NULL,
                 device_path TEXT NOT NULL, library_root TEXT NOT NULL, files_total INTEGER NOT NULL,
@@ -560,16 +655,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_roundtrip_and_forget() {
+        let (store, dir) = temp_store("rejects");
+        let a = "E:\\原图\\2026\\2026-10\\P1001.JPG".to_string();
+        let b = "E:\\原图\\2026\\2026-10\\P1001.RW2".to_string();
+
+        assert_eq!(store.set_rejects_batch(&[a.clone(), b.clone()], true).unwrap(), 2);
+        // 重复标记幂等：INSERT OR IGNORE 不再增加行数
+        assert_eq!(store.set_rejects_batch(&[a.clone()], true).unwrap(), 0);
+        let all = store.all_rejects();
+        assert!(all.contains(&a) && all.contains(&b));
+
+        assert_eq!(store.set_rejects_batch(&[b.clone()], false).unwrap(), 1);
+        assert!(!store.all_rejects().contains(&b));
+
+        // 文件移入回收站后：同一路径上的四类标记/缓存全部清掉，不留孤儿行
+        store.set_ratings_batch(&[a.clone()], Some(3)).unwrap();
+        store.set_favorites_batch(&[a.clone()], true).unwrap();
+        store.upsert_patches(&[TimePatch {
+            path: a.clone(),
+            mtime_secs: 1,
+            shoot_time: Some("2026-10-07 12:00:00".into()),
+        }]);
+        store.forget_paths(&[a.clone()]).unwrap();
+        assert!(!store.all_ratings().contains_key(&a));
+        assert!(!store.all_favorites().contains(&a));
+        assert!(!store.all_rejects().contains(&a));
+        assert!(!store.load_times().contains_key(&a));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn degraded_mode_reports_error() {
         let store = MetaStore { conn: None };
         assert!(!store.is_available());
         assert!(store.set_ratings_batch(&["x".into()], Some(3)).is_err());
         assert!(store.insert_ratings(&[("x".into(), 3)]).is_err());
         assert!(store.set_favorites_batch(&["x".into()], true).is_err());
+        assert!(store.set_rejects_batch(&["x".into()], true).is_err());
+        assert!(store.forget_paths(&["x".into()]).is_err());
         store.upsert_patches(&[]);
         assert!(store.load_times().is_empty());
         assert!(store.all_ratings().is_empty());
         assert!(store.all_favorites().is_empty());
+        assert!(store.all_rejects().is_empty());
         // 导入日志在降级模式下也要安全
         assert_eq!(store.log_import(&sample_log()), -1);
         assert!(store.recent_imports(5).is_empty());

@@ -294,3 +294,22 @@ pub struct ImportLog {
     pub cancelled: bool,
     pub failures: Vec<ImportFailure>,
 }
+
+/// 「清理废片」时逐项失败的明细（文件仍在原位置，未被移入回收站）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+/// 一次清理的结果：逐路径回报，不允许把失败项算进成功数
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectDeleteReport {
+    /// 已确认移入系统回收站的路径（回收站可还原）
+    pub deleted: Vec<String>,
+    pub failed: Vec<RejectFailure>,
+    /// 文件已删除但本地标记清理失败时如实回报（DB 可能残留孤儿行）
+    pub cleanup_warning: Option<String>,
+}

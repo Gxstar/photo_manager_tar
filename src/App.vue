@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { HardDrive, Settings as SettingsIcon, FolderOpen, Images } from "lucide-vue-next";
+import { HardDrive, Settings as SettingsIcon, FolderOpen, Images, Sparkles } from "lucide-vue-next";
 import {
   store,
   loadConfig,
@@ -14,10 +14,12 @@ import {
 import CopyOrganize from "./pages/CopyOrganize.vue";
 import Gallery from "./pages/Gallery.vue";
 import Settings from "./pages/Settings.vue";
+import SmartAlbum from "./pages/SmartAlbum.vue";
 
 const pages = [
   { id: "copy", title: "拷贝整理", icon: HardDrive, component: CopyOrganize },
   { id: "gallery", title: "图库", icon: Images, component: Gallery },
+  { id: "smart", title: "智能相册", icon: Sparkles, component: SmartAlbum },
   { id: "settings", title: "设置", icon: SettingsIcon, component: Settings },
 ];
 
@@ -124,7 +126,8 @@ watch(
       <header class="flex h-14 shrink-0 items-center border-b border-line bg-surface px-6">
         <h1 class="text-base font-semibold">{{ current.title }}</h1>
       </header>
-      <div class="min-h-0 flex-1 overflow-y-auto">
+      <!-- data-scroll-root：页面可从这里拿滚动容器，做「进入详情 → 返回」的位置还原 -->
+      <div class="min-h-0 flex-1 overflow-y-auto" data-scroll-root>
         <Transition name="fade" mode="out-in">
           <component :is="current.component" v-if="store.page" />
         </Transition>

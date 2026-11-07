@@ -34,6 +34,9 @@ pub struct GalleryItem {
     pub rating: Option<u8>,
     /// 收藏（来自 `favorites` 表）；二值、与评分互不派生
     pub favorite: bool,
+    /// 淘汰/废片标记（来自 `rejects` 表）。**只是标记，不代表文件已被删除**；
+    /// 由 `gallery_list` 注入，删除动作在复核清单里单独触发
+    pub rejected: bool,
 }
 
 /// `gallery-times` 事件的单文件补丁（只补拍摄时间）
@@ -137,6 +140,7 @@ pub fn list_items(cfg: &AppConfig) -> AppResult<Vec<GalleryItem>> {
                 shoot_time: None,
                 rating: None,
                 favorite: false,
+                rejected: false,
             });
         }
     }

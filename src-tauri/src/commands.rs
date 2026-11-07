@@ -5,7 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::gallery::{self, GalleryInfo, GalleryItem, TimesEvent};
 use crate::models::{
     AppConfig, CopyEvent, CopyPlan, Device, FileKind, HomeOverview, ImportFailure, ImportLog,
-    LibraryStats, RatingsImportReport, ScanEvent, SidecarExportReport,
+    LibraryStats, RatingsImportReport, RejectDeleteReport, RejectFailure, ScanEvent,
+    SidecarExportReport,
 };
 use crate::scanner;
 use crate::state::AppState;
@@ -409,13 +410,15 @@ pub async fn gallery_list(
 
     items.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
 
-    // 评分与收藏都来自 SQLite（权威源），与文件格式无关
+    // 评分、收藏、废片标记都来自 SQLite（权威源），与文件格式无关
     {
         let ratings = state.meta.all_ratings();
         let favorites = state.meta.all_favorites();
+        let rejects = state.meta.all_rejects();
         for it in items.iter_mut() {
             it.rating = ratings.get(&it.path).copied();
             it.favorite = favorites.contains(&it.path);
+            it.rejected = rejects.contains(&it.path);
         }
     }
 
@@ -558,4 +561,96 @@ pub async fn ratings_export_sidecars(
     tauri::async_runtime::spawn_blocking(move || crate::meta::sidecar::export(&ratings))
         .await
         .map_err(|e| AppError::IoError(e.to_string()))
+}
+
+// ── 废片标记与清理（docs §15）───────────────────────────────────────────
+
+/// 批量标记 / 取消标记废片：只写 SQLite `rejects` 表，**绝不改文件、绝不删除**。
+/// 看片时的高频零风险动作，与之后的清理动作刻意分开。
+#[tauri::command]
+pub fn gallery_set_rejected(
+    paths: Vec<String>,
+    rejected: bool,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    if !state.meta.is_available() {
+        return Err(AppError::IoError("评分数据库不可用，废片标记未保存".into()));
+    }
+    state
+        .meta
+        .set_rejects_batch(&paths, rejected)
+        .map_err(AppError::IoError)
+}
+
+/// 把复核清单里勾选的废片移入 **系统回收站**（可还原），不是永久删除。
+///
+/// 三道校验缺一不可：路径在媒体库根内、是真实文件、确实带废片标记。
+/// 逐项回报结果；只有确认删掉的路径才会清本地标记，失败项绝不混入成功数。
+/// 注意：SD 卡未清空时，这些文件下次扫描会被判为「新增」重新拷回（§15.3）。
+#[tauri::command]
+pub async fn gallery_delete_rejected(
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> AppResult<RejectDeleteReport> {
+    let cfg = state.config.lock().unwrap().clone();
+    let rejects = state.meta.all_rejects();
+    let mut report = tauri::async_runtime::spawn_blocking(
+        move || -> AppResult<RejectDeleteReport> {
+            let root = std::fs::canonicalize(&cfg.library_root)
+                .map_err(|e| AppError::LibraryUnreachable(format!("媒体库根路径不可用: {e}")))?;
+            // 加分隔符前缀，避免 E:\lib 误判到 E:\lib2
+            let root_prefix = format!(
+                "{}\\",
+                root.to_string_lossy().to_lowercase().trim_end_matches('\\')
+            );
+
+            let mut deleted = Vec::new();
+            let mut failed = Vec::new();
+            for raw in paths {
+                let p = PathBuf::from(&raw);
+                let abs = match std::fs::canonicalize(&p) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        failed.push(RejectFailure {
+                            path: raw,
+                            reason: "文件不存在或无法访问".into(),
+                        });
+                        continue;
+                    }
+                };
+                let key = abs.to_string_lossy().to_lowercase();
+                if !key.starts_with(&root_prefix) || !abs.is_file() {
+                    failed.push(RejectFailure {
+                        path: raw,
+                        reason: "不在媒体库内或不是文件，已拒绝".into(),
+                    });
+                    continue;
+                }
+                if !rejects.contains(&raw) {
+                    failed.push(RejectFailure {
+                        path: raw,
+                        reason: "未标记为废片，已拒绝".into(),
+                    });
+                    continue;
+                }
+                // 传原始路径，不用 canonicalize 后的 \\?\ 前缀 —— Shell API 不接受它
+                match crate::recycle::send_to_recycle_bin(&p) {
+                    Ok(()) => deleted.push(raw),
+                    Err(reason) => failed.push(RejectFailure { path: raw, reason }),
+                }
+            }
+            Ok(RejectDeleteReport {
+                deleted,
+                failed,
+                cleanup_warning: None,
+            })
+        },
+    )
+    .await
+    .map_err(|e| AppError::IoError(e.to_string()))??;
+
+    if !report.deleted.is_empty() {
+        report.cleanup_warning = state.meta.forget_paths(&report.deleted).err();
+    }
+    Ok(report)
 }

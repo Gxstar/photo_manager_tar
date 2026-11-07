@@ -39,6 +39,8 @@ percent-encoding = "2"
 tokio = { version = "1", features = ["sync"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 notify-debouncer-full = "0.7.0"
+# 天地图逆地理编码（仅用户填 key 并主动点「解析地名」时联网）
+ureq = "2"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
