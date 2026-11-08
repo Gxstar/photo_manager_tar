@@ -139,7 +139,16 @@ pub fn run() {
             smart::smart_group_photos,
             smart::smart_photo_location,
             smart::smart_group_overrides,
-            smart::smart_set_group_override
+            smart::smart_set_group_override,
+            smart::smart_people,
+            smart::smart_create_person,
+            smart::smart_rename_person,
+            smart::smart_delete_person,
+            smart::smart_person_photos,
+            smart::smart_person_link,
+            smart::smart_person_unlink,
+            smart::smart_set_person_cover,
+            smart::smart_photo_people
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

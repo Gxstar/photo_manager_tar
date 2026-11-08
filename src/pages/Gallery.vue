@@ -24,11 +24,13 @@ import {
   Search,
   Star,
   Trash2,
+  Users,
   WandSparkles,
   X,
 } from "lucide-vue-next";
 import { store, loadGallery, watchGalleryTimes, watchGalleryChanged, formatBytes, errMsg } from "../store.js";
 import PhotoMenu from "../components/PhotoMenu.vue";
+import PersonPicker from "../components/PersonPicker.vue";
 
 // ── 缩略图尺寸档位（对标资源管理器「查看」菜单）──────────────────────────
 // 用户选的是缩略图大小，列数由容器宽度自动算出。格宽与缩略图高按 ~1.28
@@ -701,6 +703,57 @@ const searchPos = ref({ top: 0, left: 0 });
 const searchIdx = ref(-1);
 const SEARCH_W = 288;
 
+// ── 语义搜图门禁（docs §37）───────────────────────────────────────────────
+// 入口从智能相册页搬到这个搜索浮层：与文件名搜索同属「找照片」。
+// 模型状态按需检测（只在打开浮层时查一次），不进 onMounted、不缓存 ——
+// 用户手动把模型放进目录后，下次打开浮层就能看到状态变化。
+// 门禁就是门禁：模型未就绪时灰显说明，绝不做能输入却不返回结果的假搜索框。
+const semanticStatus = ref(null); // null = 未检测；数组 = smart_model_status
+const semanticLoading = ref(false);
+const semanticError = ref("");
+const semanticActionError = ref("");
+const cnclipReady = computed(
+  () => semanticStatus.value?.find((m) => m.key === "cnclip")?.ready === true,
+);
+const semanticBadge = computed(() => {
+  if (semanticLoading.value) return { text: "检测中", cls: "bg-subtle text-ink-2" };
+  if (semanticError.value) return { text: "读取失败", cls: "bg-bad-soft text-bad" };
+  if (!semanticStatus.value) return { text: "未检测", cls: "bg-subtle text-ink-2" };
+  return cnclipReady.value
+    ? { text: "已就绪", cls: "bg-ok-soft text-ok" }
+    : { text: "未就绪", cls: "bg-subtle text-ink-2" };
+});
+const semanticHint = computed(() => {
+  if (semanticLoading.value) return "正在检测模型…";
+  if (semanticError.value) return "模型状态不可用，可重试";
+  return cnclipReady.value
+    ? "模型已就绪，中文语义推理待接入"
+    : "下载模型后可用语义搜图";
+});
+
+async function loadSemanticStatus() {
+  semanticLoading.value = true;
+  semanticError.value = "";
+  semanticActionError.value = "";
+  try {
+    semanticStatus.value = (await invoke("smart_model_status")) || [];
+  } catch (e) {
+    semanticStatus.value = null;
+    semanticError.value = errMsg(e);
+  } finally {
+    semanticLoading.value = false;
+  }
+}
+
+async function openModels() {
+  semanticActionError.value = "";
+  try {
+    await invoke("smart_open_models_dir");
+  } catch (e) {
+    semanticActionError.value = errMsg(e);
+  }
+}
+
 const searchMatches = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
   if (!q) return [];
@@ -731,6 +784,8 @@ function toggleSearch() {
   };
   searchOpen.value = true;
   nextTick(() => searchInput.value?.focus());
+  // 门禁状态按需刷新：不缓存，手动放入模型后下次打开就能看到
+  if (!semanticLoading.value) loadSemanticStatus();
 }
 
 function closeSearch() {
@@ -901,7 +956,7 @@ function onKeydown(e) {
   // 任一浮层打开时网格快捷键先让位（Esc 除外，下面用它收浮层）。
   // 复核弹窗尤其重要：否则在弹窗里按 X 会顺手把网格里的照片标成废片。
   if (
-    (viewMenuOpen.value || ctxOpen.value || searchOpen.value || reviewOpen.value) &&
+    (viewMenuOpen.value || ctxOpen.value || searchOpen.value || reviewOpen.value || personPickerOpen.value) &&
     e.key !== "Escape"
   ) return;
 
@@ -962,6 +1017,10 @@ function onKeydown(e) {
     }
     case "Escape":
       // 先收浮层，不连带清掉选择（对标资源管理器：Esc 只关当前浮层）
+      if (personPickerOpen.value) {
+        personPickerOpen.value = false;
+        return;
+      }
       if (reviewOpen.value) {
         reviewOpen.value = false;
         return;
@@ -1005,12 +1064,45 @@ function openItem(item) {
   });
 }
 
+// ── 人物关联（docs §35）──────────────────────────────────────────────────
+// 只把「选中的路径」交给弹窗，关联结果由弹窗如实回报；图库本身不改文件。
+const personPickerOpen = ref(false);
+const personPaths = ref([]);
+const photoPeople = ref([]); // 单选时这张照片已关联的人物（信息栏展示）
+let peopleReq = 0;
+
+function openPersonPicker(paths) {
+  const list = (paths || []).filter(Boolean);
+  if (!list.length) return; // 空选择不弹窗，从源头挡住空操作
+  personPaths.value = list;
+  personPickerOpen.value = true;
+}
+
+async function loadPhotoPeople(path) {
+  const req = ++peopleReq;
+  if (!path) {
+    photoPeople.value = [];
+    return;
+  }
+  try {
+    const list = await invoke("smart_photo_people", { path });
+    if (req === peopleReq) photoPeople.value = list || [];
+  } catch {
+    // 只读展示：失败不打断信息栏，下次换选中项会重试
+    if (req === peopleReq) photoPeople.value = [];
+  }
+}
+
+async function onPersonLinked() {
+  if (singleItem.value) await loadPhotoPeople(singleItem.value.path);
+}
+
 // ── 网格右键菜单（自绘，不引入系统 Shell 菜单；见 docs §16）────────────────
 // 当前只提供「交给哪个程序」+「标记废片」，不直接删 / 改名 —— 这是实现状态，
 // 不是原则禁令：§16 起图库阶段允许文件管理操作，将来可在此自绘菜单里加。
 // 与「查看」菜单同套路：Teleport 到 body + fixed，避免被 overflow-y-auto / 虚拟行 transform 裁切。
 const CTX_W = 200;
-const CTX_H = 176; // 头部 + 分隔线 + 4 项 + 两道分隔线 + padding，用于右下越界夹取
+const CTX_H = 206; // 头部 + 分隔线 + 5 项 + 三道分隔线 + padding，用于右下越界夹取
 const MAX_CTX_OPEN = 20; // Ctrl+A 全选后误点「打开」会拉起上万进程，必须兜住
 const ctxOpen = ref(false);
 const ctxPos = ref({ top: 0, left: 0 });
@@ -1098,6 +1190,7 @@ const ctxMenuItems = computed(() => {
     { key: "photoshop", label: "使用 Photoshop 打开", icon: WandSparkles, hint, disabled: ctxTooMany.value },
     // 标记是零风险可逆动作，不受 MAX_CTX_OPEN 限制（那条只挡「拉起外部程序」）
     { key: "reject", label: "标记废片（X）", icon: Ban, hint, separatorBefore: true },
+    { key: "person", label: "关联到人物…", icon: Users, hint },
     { key: "folder", label: "打开所在文件夹", icon: FolderOpen, separatorBefore: true },
   ];
 });
@@ -1105,6 +1198,7 @@ function onCtxPick(key) {
   if (key === "open") ctxOpenDefault();
   else if (key === "photoshop") ctxOpenPhotoshop();
   else if (key === "reject") ctxToggleReject();
+  else if (key === "person") openPersonPicker(ctxItems.value.map((it) => it.path));
   else if (key === "folder") ctxOpenFolder();
 }
 
@@ -1127,6 +1221,7 @@ watch(singleItem, async (item) => {
   // 切换选中时清掉上一次的写入失败提示，否则会挂在新文件信息栏里张冠李戴
   ratingError.value = null;
   favError.value = null;
+  loadPhotoPeople(item?.path);
   if (!item) return;
   const req = ++infoReq;
   infoLoading.value = true;
@@ -1900,6 +1995,33 @@ function relDir(item) {
           </div>
         </div>
 
+        <!-- 人物关联：单选显示已关联的人物；单选 / 多选都能批量关联（docs §35） -->
+        <div class="px-5 pb-3">
+          <div class="rounded-card border border-line bg-subtle px-3 py-2">
+            <div class="flex items-center justify-between gap-2">
+              <span class="shrink-0 text-xs text-ink-2">人物</span>
+              <button
+                type="button"
+                class="flex h-6 items-center gap-1 rounded-md border border-line bg-surface px-2 text-[11px] text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+                :title="`把已选的 ${rateTargets.length} 张照片关联到人物（只写本地索引，不改照片文件）`"
+                @click="openPersonPicker(rateTargets)"
+              >
+                <Users class="size-3" /> 关联到人物
+              </button>
+            </div>
+            <div v-if="photoPeople.length" class="mt-1.5 flex flex-wrap gap-1 border-t border-line pt-1.5">
+              <span
+                v-for="p in photoPeople"
+                :key="p.id"
+                class="rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] text-amber-text"
+              >{{ p.name }}</span>
+            </div>
+            <p v-else class="mt-1 text-[11px] text-ink-2">
+              {{ singleItem ? "尚未关联人物" : "多选时可批量关联到同一个人物" }}
+            </p>
+          </div>
+        </div>
+
         <!-- 单选：元数据 -->
         <dl v-if="singleItem" class="flex flex-col gap-2.5 px-5 pb-3 text-sm">
           <div v-if="infoLoading" class="py-6 text-center text-ink-3">
@@ -2049,6 +2171,31 @@ function relDir(item) {
           被筛选隐藏或标记为废片的文件不在搜索范围内；
           <button class="underline hover:text-ink" @click="clearFilters(); openReview()">清除筛选并查看废片</button>
         </p>
+
+        <!-- 语义搜图门禁（docs §37）：从智能相册页搬来，与文件名搜索共用一个入口 -->
+        <div class="mt-2 border-t border-line pt-2">
+          <div class="mb-1.5 flex items-center gap-1.5">
+            <span class="text-[11px] font-medium text-ink-2">语义搜图</span>
+            <span class="rounded-md px-1.5 py-0.5 text-[10px]" :class="semanticBadge.cls">{{ semanticBadge.text }}</span>
+          </div>
+          <div class="flex h-8 items-center gap-2 rounded-lg border border-line bg-subtle px-2 opacity-70">
+            <Search class="size-3.5 shrink-0 text-ink-3" />
+            <span class="truncate text-xs text-ink-2">{{ semanticHint }}</span>
+          </div>
+          <p v-if="semanticError" class="mt-1.5 text-[11px] leading-4 text-bad">
+            模型状态读取失败：{{ semanticError }}
+            <button class="underline hover:text-ink" @click="loadSemanticStatus">重试</button>
+          </p>
+          <div v-else-if="!cnclipReady" class="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-ink-2">
+            <span>模型未就绪，暂不可用</span>
+            <button
+              type="button"
+              class="flex h-6 items-center gap-1 rounded-md border border-line px-2 transition-colors hover:bg-hover"
+              @click="openModels"
+            ><FolderOpen class="size-3" /> 打开模型目录</button>
+          </div>
+          <p v-if="semanticActionError" class="mt-1 text-[11px] leading-4 text-bad">{{ semanticActionError }}</p>
+        </div>
       </div>
     </Teleport>
 
@@ -2137,6 +2284,14 @@ function relDir(item) {
         </div>
       </div>
     </Teleport>
+
+    <!-- 关联到人物（docs §35）：弹窗内部负责选人 / 新建 / 失败重试 / 结果回报 -->
+    <PersonPicker
+      :open="personPickerOpen"
+      :paths="personPaths"
+      @close="personPickerOpen = false"
+      @linked="onPersonLinked"
+    />
   </div>
 </template>
 

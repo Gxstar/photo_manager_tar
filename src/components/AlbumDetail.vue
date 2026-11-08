@@ -13,6 +13,8 @@ import {
   ExternalLink,
   WandSparkles,
   FolderOpen,
+  RefreshCw,
+  TriangleAlert,
 } from "lucide-vue-next";
 import PhotoMenu from "./PhotoMenu.vue";
 
@@ -36,8 +38,18 @@ const props = defineProps({
   /** 相册类型名，用于标题前的弱化标签，可空 */
   kindLabel: { type: String, default: "" },
   loading: { type: Boolean, default: false },
+  /** 读取失败文案（空 = 正常）。失败不能伪装成「这个相册没有照片」 */
+  loadError: { type: String, default: "" },
+  emptyText: { type: String, default: "这个相册里还没有照片。" },
+  /** 语境动作：追加到右键菜单，如人物相册的「取消关联」。不传 = 地点相册原行为 */
+  contextActions: { type: Array, default: () => [] },
+  /** 信息条按钮：[{ key, label, tone? }]，点击 emit action({key, path}) */
+  infoActions: { type: Array, default: () => [] },
+  /** 宿主动作反馈（如「已取消关联」）；空 = 不显示 */
+  notice: { type: String, default: "" },
+  noticeTone: { type: String, default: "ok" }, // ok | info | bad
 });
-const emit = defineEmits(["back", "set-cover", "rename"]);
+const emit = defineEmits(["back", "set-cover", "rename", "action", "retry"]);
 
 const RAW_EXT = new Set(["rw2", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rwl", "srw"]);
 const active = ref(null);
@@ -162,8 +174,9 @@ function onTileContextMenu(path, e) {
   e.preventDefault(); // 屏蔽 WebView2 原生菜单
   pick(path); // 右键同时选中，信息条跟着切到这张
   ctxPath.value = path;
-  // 与图库同一套夹取：4 项菜单实测 174px，留 176 的余量（菜单项数变了要同步改这里）
-  const h = 176;
+  // 与图库同一套夹取：4 项菜单实测 174px，留 176 的余量；
+  // 语境动作每项约 30px，随 contextActions 数量一起抬高，避免菜单底部被裁。
+  const h = 176 + props.contextActions.length * 30;
   ctxPos.value = {
     left: Math.max(8, Math.min(e.clientX, window.innerWidth - CTX_W - 8)),
     top: Math.max(8, Math.min(e.clientY, window.innerHeight - h - 8)),
@@ -185,6 +198,7 @@ const ctxMenuItems = computed(() => {
       separatorBefore: true,
     },
     { key: "folder", label: "打开所在文件夹", icon: FolderOpen, separatorBefore: true },
+    ...props.contextActions,
   ];
 });
 
@@ -192,6 +206,11 @@ async function onCtxPick(key) {
   const p = ctxPath.value;
   ctxOpen.value = false;
   if (!p) return;
+  // 语境动作交给宿主处理（人物相册的取消关联等），组件本身不碰业务数据
+  if (props.contextActions.some((a) => a.key === key)) {
+    emit("action", { key, path: p });
+    return;
+  }
   try {
     if (key === "open") await invoke("gallery_open", { path: p });
     else if (key === "photoshop") await invoke("open_with_photoshop", { paths: [p] });
@@ -258,6 +277,18 @@ watch(
     info.value = null;
     failed.value = new Set();
     renaming.value = false;
+  },
+);
+
+// 成员变化（如取消关联）后，选中项可能已不在列表里：清掉，别让信息栏
+// 继续显示一张已被移出的照片。
+watch(
+  () => props.photos,
+  (list) => {
+    if (active.value && !list.includes(active.value)) {
+      active.value = null;
+      info.value = null;
+    }
   },
 );
 
@@ -352,6 +383,15 @@ onBeforeUnmount(() => {
             title="用系统看图打开（双击缩略图同效）"
             @click="openFile(active)"
           >打开</button>
+          <button
+            v-for="a in infoActions"
+            :key="a.key"
+            type="button"
+            class="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors"
+            :class="a.tone === 'bad' ? 'text-bad hover:bg-bad-soft' : 'text-ink-2 hover:bg-hover'"
+            :title="a.title || a.label"
+            @click="emit('action', { key: a.key, path: active })"
+          >{{ a.label }}</button>
         </div>
         <div v-else class="flex h-8 items-center gap-2 text-[11px] text-ink-2">
           <span>单击选中查看信息 · 双击用系统看图打开 · 右键更多操作 · Esc 返回</span>
@@ -363,9 +403,29 @@ onBeforeUnmount(() => {
       <p v-if="actionError" class="mt-1 truncate rounded-md bg-bad-soft px-2 py-1 text-[11px] text-bad" :title="actionError">
         {{ actionError }}
       </p>
+      <!-- 宿主动作反馈：取消关联 / 重命名的成功、重复或失败 -->
+      <p
+        v-if="notice"
+        class="mt-1 truncate rounded-md px-2 py-1 text-[11px]"
+        :class="noticeTone === 'bad' ? 'bg-bad-soft text-bad' : noticeTone === 'info' ? 'bg-info-soft text-info' : 'bg-ok-soft text-ok'"
+        :title="notice"
+      >{{ notice }}</p>
     </div>
 
-    <div v-if="loading" class="py-16 text-center text-xs text-ink-2">读取照片…</div>
+    <!-- 读取失败：明确报错 + 重试，不用空态冒充失败（docs §35.5） -->
+    <div v-if="loadError" class="py-16 text-center">
+      <p class="mx-auto flex max-w-md items-start gap-1.5 rounded-lg bg-bad-soft px-3 py-2 text-left text-xs leading-5 text-bad">
+        <TriangleAlert class="mt-0.5 size-3.5 shrink-0" /> 读取照片失败：{{ loadError }}
+      </p>
+      <button
+        type="button"
+        class="mx-auto mt-3 flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-xs text-ink-2 transition-colors hover:bg-hover"
+        @click="emit('retry')"
+      >
+        <RefreshCw class="size-3.5" /> 重试
+      </button>
+    </div>
+    <div v-else-if="loading" class="py-16 text-center text-xs text-ink-2">读取照片…</div>
     <div
       v-else-if="sorted.length"
       class="mt-3 grid grid-cols-3 gap-1.5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 2xl:grid-cols-8"
@@ -427,7 +487,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <p v-else class="py-16 text-center text-xs leading-5 text-ink-2">
-      这个相册里还没有照片。
+      {{ emptyText }}
     </p>
 
     <PhotoMenu

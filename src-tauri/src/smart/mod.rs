@@ -222,6 +222,89 @@ pub struct OnlineSettings {
     pub level: String,
 }
 
+/// 人物相册（docs §35）。复用 `albums(kind='person')` + `album_members(source='user')`，
+/// 零新表、零 schema 变更；`coverPath` 为展示封面（用户指定优先，否则回退成员首图）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonRow {
+    pub id: i64,
+    pub name: String,
+    pub cover_path: Option<String>,
+    pub count: i64,
+    pub created_at: String,
+}
+
+/// 关联 / 取消关联的结果。重复操作不算失败，但要如实回报数字，
+/// 前端据此提示「新增 N 张 · M 张已在该人物中，已跳过」。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkReport {
+    pub added: usize,
+    pub duplicates: usize,
+    pub removed: usize,
+    pub not_linked: usize,
+    /// 路径为空 / 文件已不在库中，未写入索引
+    pub skipped: usize,
+}
+
+/// 人物查询统一列顺序：id / name / 展示封面 / 成员数 / created_at。
+/// 封面为空时回退成员首图（只影响展示，不写库），避免新人物刚关联照片时封面空白。
+fn person_select(where_sql: &str) -> String {
+    format!(
+        "SELECT a.id, a.name,
+                COALESCE(a.cover_path,
+                    (SELECT m.path FROM album_members m WHERE m.album_id = a.id ORDER BY m.path LIMIT 1)),
+                (SELECT COUNT(*) FROM album_members m WHERE m.album_id = a.id),
+                a.created_at
+         FROM albums a {where_sql}"
+    )
+}
+
+fn map_person_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PersonRow> {
+    Ok(PersonRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        cover_path: r.get(2)?,
+        count: r.get(3)?,
+        created_at: r.get(4)?,
+    })
+}
+
+fn person_name(name: &str) -> Result<&str, String> {
+    let v = name.trim();
+    if v.is_empty() {
+        return Err("人物名字不能为空".into());
+    }
+    if v.chars().count() > 40 {
+        return Err("人物名字最多 40 个字".into());
+    }
+    Ok(v)
+}
+
+/// 同名（大小写不敏感）检查；rename 时排除自己。
+fn person_name_exists(
+    db: &Connection,
+    name: &str,
+    exclude_id: Option<i64>,
+) -> Result<bool, String> {
+    let found = match exclude_id {
+        Some(id) => db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM albums WHERE kind = 'person'
+               AND name = ?1 COLLATE NOCASE AND id <> ?2)",
+            params![name, id],
+            |r| r.get::<_, i64>(0),
+        ),
+        None => db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM albums WHERE kind = 'person'
+               AND name = ?1 COLLATE NOCASE)",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        ),
+    };
+    let n = found.map_err(|e| format!("读取人物失败: {e}"))?;
+    Ok(n != 0)
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpsPoint {
@@ -836,6 +919,224 @@ impl Smart {
         Ok(())
     }
 
+    // ── 人物相册：手动建册（docs §35）────────────────────────────────────
+    // 复用 albums(kind='person') + album_members(source='user')，零新表。
+    // 所有写操作在 DB 不可用 / 被占用 / 目标不存在时返回 Err，绝不静默成功。
+
+    fn person_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| "smart.db 不可用，人物相册数据未保存".to_string())?;
+        conn.lock()
+            .map_err(|_| "smart.db 被占用，请稍后重试".to_string())
+    }
+
+    /// 人物存在性校验：读照片 / 关联 / 取消关联前都要过这一关，
+    /// 「人物已被删除」不能伪装成「这个人物里没有照片」。
+    fn ensure_person(db: &Connection, id: i64) -> Result<(), String> {
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM albums WHERE id = ?1 AND kind = 'person')",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("读取人物失败: {e}"))?;
+        if !exists {
+            return Err("人物不存在或已被删除，请刷新后重试".into());
+        }
+        Ok(())
+    }
+
+    pub fn people(&self) -> Result<Vec<PersonRow>, String> {
+        let db = self.person_conn()?;
+        let sql = person_select("WHERE a.kind = 'person' ORDER BY a.id");
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| format!("读取人物失败: {e}"))?;
+        stmt.query_map([], map_person_row)
+            .map_err(|e| format!("读取人物失败: {e}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("读取人物失败: {e}"))
+    }
+
+    /// 单张照片已关联的人物（图库信息栏用）。只读展示，失败返回空而非打断信息栏。
+    pub fn photo_people(&self, path: &str) -> Vec<PersonRow> {
+        let Ok(db) = self.person_conn() else {
+            return Vec::new();
+        };
+        let sql = person_select(
+            "JOIN album_members pm ON pm.album_id = a.id
+             WHERE a.kind = 'person' AND pm.path = ?1 ORDER BY a.id",
+        );
+        let Ok(mut stmt) = db.prepare(&sql) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![path], map_person_row)
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn create_person(&self, name: &str) -> Result<PersonRow, String> {
+        let name = person_name(name)?;
+        let db = self.person_conn()?;
+        if person_name_exists(&db, name, None)? {
+            return Err(format!("已存在同名人物「{name}」"));
+        }
+        let now = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        db.execute(
+            "INSERT INTO albums (kind, name, created_at) VALUES ('person', ?1, ?2)",
+            params![name, now],
+        )
+        .map_err(|e| format!("新建人物失败: {e}"))?;
+        Ok(PersonRow {
+            id: db.last_insert_rowid(),
+            name: name.to_string(),
+            cover_path: None,
+            count: 0,
+            created_at: now,
+        })
+    }
+
+    pub fn rename_person(&self, id: i64, name: &str) -> Result<(), String> {
+        let name = person_name(name)?;
+        let db = self.person_conn()?;
+        Self::ensure_person(&db, id)?;
+        if person_name_exists(&db, name, Some(id))? {
+            return Err(format!("已存在同名人物「{name}」"));
+        }
+        let n = db
+            .execute(
+                "UPDATE albums SET name = ?1 WHERE id = ?2 AND kind = 'person'",
+                params![name, id],
+            )
+            .map_err(|e| format!("重命名失败: {e}"))?;
+        if n == 0 {
+            return Err("人物不存在或已被删除".into());
+        }
+        Ok(())
+    }
+
+    /// 删除人物及其全部关联（单事务）。**只删索引，照片文件零改动**。
+    pub fn delete_person(&self, id: i64) -> Result<usize, String> {
+        let mut db = self.person_conn()?;
+        let tx = db.transaction().map_err(|e| format!("删除人物失败: {e}"))?;
+        Self::ensure_person(&tx, id)?;
+        let n = tx
+            .execute("DELETE FROM album_members WHERE album_id = ?1", params![id])
+            .map_err(|e| format!("删除人物失败: {e}"))?;
+        tx.execute("DELETE FROM albums WHERE id = ?1 AND kind = 'person'", params![id])
+            .map_err(|e| format!("删除人物失败: {e}"))?;
+        tx.commit().map_err(|e| format!("删除人物失败: {e}"))?;
+        Ok(n)
+    }
+
+    pub fn person_photos(&self, id: i64) -> Result<Vec<String>, String> {
+        let db = self.person_conn()?;
+        Self::ensure_person(&db, id)?;
+        let mut stmt = db
+            .prepare("SELECT path FROM album_members WHERE album_id = ?1 ORDER BY path")
+            .map_err(|e| format!("读取人物照片失败: {e}"))?;
+        stmt.query_map(params![id], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("读取人物照片失败: {e}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("读取人物照片失败: {e}"))
+    }
+
+    /// 批量关联：`INSERT OR IGNORE` 幂等。同批重复 / 已关联 / 文件已不在库中
+    /// 都如实计数，不报错也不重复写入（docs §35.5 重复操作）。
+    pub fn person_link(&self, id: i64, paths: &[String]) -> Result<LinkReport, String> {
+        let mut db = self.person_conn()?;
+        Self::ensure_person(&db, id)?;
+        let tx = db.transaction().map_err(|e| format!("关联失败: {e}"))?;
+        let mut report = LinkReport::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for raw in paths {
+            let p = raw.trim();
+            if p.is_empty() || !Path::new(p).is_file() {
+                report.skipped += 1;
+                continue;
+            }
+            if !seen.insert(p.to_string()) {
+                report.duplicates += 1;
+                continue;
+            }
+            let n = tx
+                .execute(
+                    "INSERT OR IGNORE INTO album_members (album_id, path, confidence, source)
+                     VALUES (?1, ?2, NULL, 'user')",
+                    params![id, p],
+                )
+                .map_err(|e| format!("关联失败: {e}"))?;
+            if n > 0 {
+                report.added += 1;
+            } else {
+                report.duplicates += 1;
+            }
+        }
+        tx.commit().map_err(|e| format!("关联失败: {e}"))?;
+        Ok(report)
+    }
+
+    /// 批量取消关联。删到封面时清掉 `cover_path`，让列表回退到剩余成员首图，
+    /// 不留下指向已移除照片的空封面卡。
+    pub fn person_unlink(&self, id: i64, paths: &[String]) -> Result<LinkReport, String> {
+        let mut db = self.person_conn()?;
+        Self::ensure_person(&db, id)?;
+        let tx = db.transaction().map_err(|e| format!("取消关联失败: {e}"))?;
+        let mut report = LinkReport::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for raw in paths {
+            let p = raw.trim();
+            if p.is_empty() || !seen.insert(p.to_string()) {
+                continue;
+            }
+            let n = tx
+                .execute(
+                    "DELETE FROM album_members WHERE album_id = ?1 AND path = ?2",
+                    params![id, p],
+                )
+                .map_err(|e| format!("取消关联失败: {e}"))?;
+            if n > 0 {
+                report.removed += 1;
+            } else {
+                report.not_linked += 1;
+            }
+        }
+        tx.execute(
+            "UPDATE albums SET cover_path = NULL
+             WHERE id = ?1 AND kind = 'person' AND cover_path IS NOT NULL
+               AND cover_path NOT IN (SELECT path FROM album_members WHERE album_id = ?1)",
+            params![id],
+        )
+        .map_err(|e| format!("取消关联失败: {e}"))?;
+        tx.commit().map_err(|e| format!("取消关联失败: {e}"))?;
+        Ok(report)
+    }
+
+    pub fn set_person_cover(&self, id: i64, path: &str) -> Result<(), String> {
+        let db = self.person_conn()?;
+        Self::ensure_person(&db, id)?;
+        let is_member: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM album_members WHERE album_id = ?1 AND path = ?2)",
+                params![id, path],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("设置封面失败: {e}"))?;
+        if !is_member {
+            return Err("这张照片不在该人物相册中，无法设为封面".into());
+        }
+        db.execute(
+            "UPDATE albums SET cover_path = ?1 WHERE id = ?2 AND kind = 'person'",
+            params![path, id],
+        )
+        .map_err(|e| format!("设置封面失败: {e}"))?;
+        Ok(())
+    }
+
     /// 按簇中心逐个请求天地图逆地理编码，结果缓存进 albums；已解析的跳过。
     /// **只发送经纬度**，不发送照片 / 路径 / 任何库内信息；失败不中断其它相册。
     pub fn geocode_places<F>(&self, key: &str, mut progress: F) -> Result<GeocodeSummary, String>
@@ -1034,6 +1335,79 @@ pub fn smart_set_group_override(
     value: String,
 ) -> Result<(), String> {
     state.smart.set_group_override(&key, &value)
+}
+
+// ── 人物相册命令（docs §35）─────────────────────────────────────────────
+// 参数只用 id / name / paths，避开 snake_case → camelCase 的命名歧义。
+
+#[tauri::command]
+pub fn smart_people(state: State<'_, AppState>) -> Result<Vec<PersonRow>, String> {
+    state.smart.people()
+}
+
+#[tauri::command]
+pub fn smart_create_person(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<PersonRow, String> {
+    state.smart.create_person(&name)
+}
+
+#[tauri::command]
+pub fn smart_rename_person(
+    state: State<'_, AppState>,
+    id: i64,
+    name: String,
+) -> Result<(), String> {
+    state.smart.rename_person(id, &name)
+}
+
+#[tauri::command]
+pub fn smart_delete_person(state: State<'_, AppState>, id: i64) -> Result<usize, String> {
+    state.smart.delete_person(id)
+}
+
+#[tauri::command]
+pub fn smart_person_photos(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Vec<String>, String> {
+    state.smart.person_photos(id)
+}
+
+#[tauri::command]
+pub fn smart_person_link(
+    state: State<'_, AppState>,
+    id: i64,
+    paths: Vec<String>,
+) -> Result<LinkReport, String> {
+    state.smart.person_link(id, &paths)
+}
+
+#[tauri::command]
+pub fn smart_person_unlink(
+    state: State<'_, AppState>,
+    id: i64,
+    paths: Vec<String>,
+) -> Result<LinkReport, String> {
+    state.smart.person_unlink(id, &paths)
+}
+
+#[tauri::command]
+pub fn smart_set_person_cover(
+    state: State<'_, AppState>,
+    id: i64,
+    path: String,
+) -> Result<(), String> {
+    state.smart.set_person_cover(id, &path)
+}
+
+#[tauri::command]
+pub fn smart_photo_people(
+    state: State<'_, AppState>,
+    path: String,
+) -> Vec<PersonRow> {
+    state.smart.photo_people(&path)
 }
 
 /// 逆地理编码结果：三级行政区划 + 详细地址。
@@ -1480,6 +1854,122 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── 人物相册（docs §35）───────────────────────────────────────────
+    fn person_store(name: &str) -> (Smart, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sdi-person-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE albums (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL,
+                cover_path TEXT, lat REAL, lon REAL, province TEXT, city TEXT,
+                county TEXT, address TEXT, geocoded INTEGER, created_at TEXT NOT NULL
+             );
+             CREATE TABLE album_members (
+                album_id INTEGER NOT NULL, path TEXT NOT NULL,
+                confidence REAL, source TEXT NOT NULL, PRIMARY KEY (album_id, path)
+             );
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        )
+        .unwrap();
+        (Smart { conn: Some(Mutex::new(c)) }, dir)
+    }
+
+    fn shot(dir: &Path, name: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, b"photo").unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn person_crud_rejects_duplicate_name_and_cascades() {
+        let (s, dir) = person_store("crud");
+        assert!(s.people().unwrap().is_empty(), "初始无人物");
+        let a = s.create_person("  阿星  ").unwrap();
+        assert_eq!(a.name, "阿星", "名字 trim 后入库");
+        assert!(s.create_person("阿星").is_err(), "重名必须拒绝");
+        assert!(s.create_person("阿星 ").is_err(), "trim 后重名也要拒绝");
+        assert!(s.create_person("   ").is_err());
+        assert!(s.create_person(&"x".repeat(41)).is_err());
+
+        s.create_person("小Q").unwrap();
+        assert!(s.rename_person(a.id, "小Q").is_err(), "改成别人的名字也要拒绝");
+        s.rename_person(a.id, "阿星2").unwrap();
+        assert_eq!(s.people().unwrap()[0].name, "阿星2");
+
+        let p = shot(&dir, "P1.JPG");
+        s.person_link(a.id, &[p]).unwrap();
+        assert_eq!(s.delete_person(a.id).unwrap(), 1, "级联删除返回关联数");
+        assert_eq!(s.people().unwrap().len(), 1, "只删目标人物");
+        assert!(s.person_photos(a.id).is_err(), "删后不能伪装成空相册");
+        assert!(s.delete_person(a.id).is_err(), "重复删除要报错");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn person_link_is_idempotent_and_reports_duplicates() {
+        let (s, dir) = person_store("link");
+        let a = s.create_person("阿星").unwrap();
+        let p1 = shot(&dir, "P1.JPG");
+        let p2 = shot(&dir, "P1.RW2");
+
+        let r = s.person_link(a.id, &[p1.clone(), p2.clone()]).unwrap();
+        assert_eq!((r.added, r.duplicates, r.skipped), (2, 0, 0));
+
+        // 已关联 / 同批重复 / 文件已不在库中：全部如实计数，不写孤儿行
+        let missing = dir.join("GONE.JPG").to_string_lossy().to_string();
+        let r = s.person_link(a.id, &[p1.clone(), p1.clone(), missing]).unwrap();
+        assert_eq!(r.added, 0);
+        assert_eq!(r.duplicates, 2);
+        assert_eq!(r.skipped, 1);
+        assert_eq!(s.person_photos(a.id).unwrap().len(), 2);
+        assert_eq!(s.people().unwrap()[0].count, 2);
+        assert_eq!(s.photo_people(&p1).len(), 1, "图库信息栏能查到关联人物");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn person_unlink_clears_stale_cover() {
+        let (s, dir) = person_store("unlink");
+        let a = s.create_person("阿星").unwrap();
+        let p1 = shot(&dir, "A.JPG");
+        let p2 = shot(&dir, "B.JPG");
+        s.person_link(a.id, &[p1.clone(), p2.clone()]).unwrap();
+        s.set_person_cover(a.id, &p1).unwrap();
+        assert!(s.set_person_cover(a.id, "C.JPG").is_err(), "非成员不能设为封面");
+
+        let r = s.person_unlink(a.id, &[p1.clone()]).unwrap();
+        assert_eq!((r.removed, r.not_linked), (1, 0));
+        let r = s.person_unlink(a.id, &[p1.clone()]).unwrap();
+        assert_eq!((r.removed, r.not_linked), (0, 1), "重复取消如实回报");
+
+        let row = &s.people().unwrap()[0];
+        assert_eq!(row.count, 1);
+        assert_eq!(row.cover_path.as_deref(), Some(p2.as_str()), "封面回退到剩余成员");
+        assert!(s.photo_people(&p1).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn person_commands_report_missing_person_and_degraded_db() {
+        let (s, dir) = person_store("errors");
+        assert!(s.person_photos(999).is_err());
+        assert!(s.person_link(999, &[]).is_err());
+        assert!(s.person_unlink(999, &[]).is_err());
+        assert!(s.rename_person(999, "x").is_err());
+        assert!(s.delete_person(999).is_err());
+        assert!(s.set_person_cover(999, "x").is_err());
+
+        let dead = Smart { conn: None };
+        assert!(dead.people().is_err(), "DB 不可用不能冒充空数据");
+        assert!(dead.create_person("阿星").is_err());
+        assert!(dead.person_photos(1).is_err());
+        assert!(dead.person_link(1, &[]).is_err());
+        assert!(dead.photo_people("x").is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
