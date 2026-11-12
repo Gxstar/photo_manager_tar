@@ -41,6 +41,11 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 notify-debouncer-full = "0.7.0"
 # 天地图逆地理编码（仅用户填 key 并主动点「解析地名」时联网）
 ureq = "2"
+# 模型下载后的 SHA-256 校验（纯 Rust，无额外动态库；docs §38.4）
+sha2 = "0.10"
+# ONNX Runtime：动态加载 resources/onnxruntime.dll（不从 pyke CDN 下载，国内不可用）
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["load-dynamic", "api-31"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

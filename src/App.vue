@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { HardDrive, Settings as SettingsIcon, FolderOpen, Images, Sparkles } from "lucide-vue-next";
 import {
@@ -15,6 +15,7 @@ import CopyOrganize from "./pages/CopyOrganize.vue";
 import Gallery from "./pages/Gallery.vue";
 import Settings from "./pages/Settings.vue";
 import SmartAlbum from "./pages/SmartAlbum.vue";
+import FaceScanPrompt from "./components/FaceScanPrompt.vue";
 
 const pages = [
   { id: "copy", title: "拷贝整理", icon: HardDrive, component: CopyOrganize },
@@ -51,7 +52,41 @@ onMounted(async () => {
   await refreshDevices();
   store.page = pickStartPage();
   loadStats(); // 全库统计较慢，不阻塞首屏（侧边栏数据异步补齐）
+  // 人脸同意询问推到首屏之后：它要读 smart.db，不该和首屏抢时间
+  setTimeout(checkFaceConsent, 1200);
 });
+
+/**
+ * 人脸扫描的知情同意（docs §38 人物批）：
+ * - 已同意 → 直接排后台扫描（后端自己判断模型/是否已在扫）；
+ * - 从没问过且模型已就绪 → 弹窗询问；模型没下载就不问，免得承诺一件做不到的事；
+ * - 已拒绝 → 什么都不做，只保留手动按钮。
+ */
+const facePromptOpen = ref(false);
+
+async function checkFaceConsent() {
+  try {
+    const st = await invoke("smart_face_auto_scan_get");
+    if (!st) return;
+    if (st.consent === "on") {
+      await invoke("smart_face_auto_start");
+    } else if (st.consent === "ask" && st.modelReady) {
+      facePromptOpen.value = true;
+    }
+  } catch {
+    // 智能模块不可用（smart.db 损坏等）不该拦住主流程，也不弹半截提示
+  }
+}
+
+async function chooseFaceScan(choice) {
+  facePromptOpen.value = false;
+  try {
+    await invoke("smart_set_face_auto_scan", { choice });
+    if (choice === "on") await invoke("smart_face_auto_start");
+  } catch {
+    // 写入失败：下次启动会重新询问，不在这里打扰用户
+  }
+}
 
 // 记录上次停留页，供下次启动恢复。
 // 首次触发是启动落点（程序决定，不算用户选择），跳过以免把「有卡强制导入」写回配置
@@ -133,6 +168,9 @@ watch(
         </Transition>
       </div>
     </main>
+
+    <!-- 首次启动的人脸扫描同意（生物特征，必须先问再扫） -->
+    <FaceScanPrompt :open="facePromptOpen" @choose="chooseFaceScan" />
   </div>
 </template>
 

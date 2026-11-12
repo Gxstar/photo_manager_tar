@@ -49,6 +49,18 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state::AppState::new())
         .setup(|app| {
+            // ONNX Runtime 动态库：优先打包后的 resource_dir，开发期回退到 crate 根。
+            // 不从 pyke CDN 下载（国内不可用），DLL 随应用分发。
+            let dll = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|d| d.join("onnxruntime.dll"))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/onnxruntime.dll")
+                });
+            smart::clip::set_dll(dll);
             // 媒体库热刷新监听：文件增删改 → 防抖 → 前端重拉图库
             watch::spawn(&app.handle());
             Ok(())
@@ -124,6 +136,25 @@ pub fn run() {
             commands::ratings_import_from_files,
             commands::ratings_export_sidecars,
             smart::smart_model_status,
+            smart::smart_download_model,
+            smart::smart_cancel_download,
+            smart::smart_delete_model,
+            smart::smart_index_start,
+            smart::smart_index_cancel,
+            smart::smart_search,
+            smart::smart_things,
+            smart::smart_thing_photos,
+            smart::smart_backfill_tags,
+            smart::smart_face_scan,
+            smart::smart_face_cancel,
+            smart::smart_face_auto_start,
+            smart::smart_face_auto_scan_get,
+            smart::smart_set_face_auto_scan,
+            smart::smart_face_clusters,
+            smart::smart_face_cluster_photos,
+            smart::smart_face_name,
+            smart::smart_face_ignore,
+            smart::smart_face_clear,
             smart::smart_places,
             smart::smart_ingest_gps,
             smart::smart_db_path,

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   Image as ImageIcon,
@@ -14,6 +15,7 @@ import {
   TriangleAlert,
   ScanSearch,
   Languages,
+  Sparkles,
   X,
 } from "lucide-vue-next";
 import AlbumCard from "../components/AlbumCard.vue";
@@ -25,7 +27,7 @@ import { errMsg } from "../store.js";
 // 页内分段（§36）：一次只渲染一段，人物 / 地点 / 地图互不挤占；
 // detail 时列表区整体让位给 AlbumDetail（沿用 §30 的 v-if / v-else）。
 // 默认落 place：真实库已有 65 个 GPS 簇、0 个人物，先给有数据的一段。
-const view = ref("place"); // person | place | map | detail
+const view = ref("place"); // person | thing | place | map | detail
 const lastListView = ref("place"); // 进入详情前的分段，返回时还原
 const rootEl = ref(null);
 let listScroll = 0;
@@ -57,8 +59,25 @@ const ALBUM_KINDS = {
     contextActions: [],
     infoActions: [],
   },
+  thing: {
+    backLabel: "事物分类",
+    tag: "事物",
+    emptyText: "这个分类下还没有照片。自动分类只按内容聚合，可能有误差；不支持改名或设封面。",
+    contextActions: [],
+    infoActions: [],
+  },
+  // 待命名人脸簇：只读浏览。命名仍在卡片上做，详情里不再塞一套表单。
+  cluster: {
+    backLabel: "待命名人物",
+    tag: "人物",
+    emptyText: "这个簇里还没有照片。",
+    contextActions: [],
+    infoActions: [],
+  },
 };
 const albumKind = ref("place");
+/** 详情页展示的人脸簇快照（albumKind === 'cluster' 时用） */
+const clusterSel = ref(null);
 const kindMeta = computed(() => ALBUM_KINDS[albumKind.value] ?? ALBUM_KINDS.place);
 const places = ref([]); // 65 个 GPS 簇（原始点位，不因显示级别改变）
 const overrides = ref({});
@@ -94,6 +113,23 @@ let personNoticeTimer = 0;
 
 const personPhotoCount = computed(() =>
   people.value.reduce((s, p) => s + (p.count || 0), 0),
+);
+
+// ── 事物分类（docs §38 主体分类）：CLIP 零样本标签，固定集合，自动生成 ──────
+const things = ref([]);
+const thingsLoading = ref(false);
+const thingsError = ref("");
+const thingHitCount = computed(() => things.value.reduce((s, t) => s + (t.count || 0), 0));
+/** 标签 → 与地点相册同构的卡片，复用 AlbumDetail / openAlbum */
+const thingGroups = computed(() =>
+  things.value.map((t) => ({
+    key: `thing:${t.label}`,
+    kind: "thing",
+    label: t.label,
+    subtitle: "自动分类",
+    count: t.count,
+    coverPath: t.coverPath || "",
+  })),
 );
 /** 人物 → 与地点相册同构的卡片对象，保证 AlbumDetail / openAlbum 完全复用 */
 const personGroups = computed(() =>
@@ -190,10 +226,19 @@ const groups = computed(() => {
   return out.sort((a, b) => b.count - a.count);
 });
 
-/** 当前打开的相册：地点从 groups、人物从 personGroups，其余行为完全一致 */
+/** 当前打开的相册：地点 / 人物 / 事物 / 人脸簇各取自己的池，其余行为完全一致 */
 const selectedGroup = computed(() => {
   if (!selectedKey.value) return null;
-  const pool = albumKind.value === "person" ? personGroups.value : groups.value;
+  if (albumKind.value === "cluster") {
+    // 人脸簇是运行态数据（不进 groups 池），直接持有快照
+    return clusterSel.value;
+  }
+  const pool =
+    albumKind.value === "person"
+      ? personGroups.value
+      : albumKind.value === "thing"
+        ? thingGroups.value
+        : groups.value;
   return pool.find((g) => g.key === selectedKey.value) || null;
 });
 
@@ -201,6 +246,7 @@ const selectedGroup = computed(() => {
 const viewHint = computed(() => {
   const hints = {
     person: "手动建册 · 到图库选中照片右键「关联到人物」",
+    thing: "CLIP 零样本自动分类 · 按内容聚合，可能有误差",
     place: "EXIF GPS 坐标聚类 · 省 / 市 / 县分级",
     map: "WGS-84 → GCJ-02 纠偏 · 高德瓦片",
   };
@@ -249,7 +295,11 @@ async function loadPhotos(g) {
     photos.value =
       g.kind === "person"
         ? await invoke("smart_person_photos", { id: g.id })
-        : await invoke("smart_group_photos", { ids: g.ids });
+        : g.kind === "thing"
+          ? await invoke("smart_thing_photos", { label: g.label })
+          : g.kind === "cluster"
+            ? await invoke("smart_face_cluster_photos", { id: g.id })
+            : await invoke("smart_group_photos", { ids: g.ids });
   } catch (e) {
     photos.value = [];
     photosError.value = errMsg(e);
@@ -272,6 +322,318 @@ async function loadPeople() {
   }
 }
 
+/** 事物分类：后端首次会按已有向量回填标签（不重新推理），失败不连累其它段 */
+async function loadThings() {
+  thingsLoading.value = true;
+  thingsError.value = "";
+  try {
+    things.value = (await invoke("smart_things")) || [];
+  } catch (e) {
+    things.value = [];
+    thingsError.value = errMsg(e);
+  } finally {
+    thingsLoading.value = false;
+  }
+}
+
+// ── 人脸自动识别（docs §38 人物批）：扫描 → 未命名簇 → 命名 / 忽略 ────────
+const faceClusters = ref([]);
+const faceLoading = ref(false);
+const faceError = ref("");
+const faceScanning = ref(false);
+const faceProgress = ref(null);
+/** ask = 还没问过；on = 允许后台扫；off = 只手动 */
+const faceConsent = ref("ask");
+const faceScanned = ref(0);
+/** 旧结果与新算法版本不一致：必须先清除再扫 */
+const faceStale = ref(false);
+const faceNotice = ref("");
+const namingId = ref(null);
+const namingText = ref("");
+const namingBusy = ref(false);
+const faceAutoOn = computed(() => faceConsent.value === "on");
+
+const faceScanPct = computed(() => {
+  const p = faceProgress.value;
+  return p && p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+});
+
+function thumbUrl(path) {
+  return path ? `http://thumb.localhost/${encodeURIComponent(path)}?v=2` : "";
+}
+
+/** quiet=true：扫描中的后台刷新，不动 loading / 不清空列表、不报错刷屏 */
+async function loadFaceClusters(quiet = false) {
+  if (!quiet) faceLoading.value = true;
+  try {
+    const list = (await invoke("smart_face_clusters")) || [];
+    // 已命名（personId）与已忽略的簇不进「待命名」列表
+    faceClusters.value = list.filter((c) => !c.ignored && !c.personId);
+  } catch (e) {
+    if (!quiet) {
+      faceClusters.value = [];
+      faceError.value = errMsg(e);
+    }
+  } finally {
+    if (!quiet) faceLoading.value = false;
+  }
+}
+
+/**
+ * 后端是**逐张**点积聚类的，簇在扫描过程中就已经写进 `smart.db`，
+ * 所以「要扫完才看得到」纯属前端没刷新。这里节流到每 4 秒拉一次，
+ * 既能看到簇边扫边长，又不会把 IPC 和 smart.db 打满。
+ */
+let clusterRefreshAt = 0;
+let clusterRefreshTimer = null;
+function scheduleClusterRefresh() {
+  const wait = 4000 - (Date.now() - clusterRefreshAt);
+  if (wait <= 0) {
+    clusterRefreshAt = Date.now();
+    loadFaceClusters(true);
+    return;
+  }
+  if (clusterRefreshTimer) return;
+  clusterRefreshTimer = setTimeout(() => {
+    clusterRefreshTimer = null;
+    clusterRefreshAt = Date.now();
+    loadFaceClusters(true);
+  }, wait);
+}
+
+/** 扫描进度与结果都走全局事件：手动扫描、后台自动扫描、重进页面共用一条通道 */
+const faceUnlisten = [];
+/** 粗略剩余时间：有脸的照片要解码原图（慢），没脸的很快，所以只能给个量级 */
+const faceEta = ref("");
+let faceStartedAt = 0;
+function updateFaceEta(p) {
+  if (!faceStartedAt) faceStartedAt = Date.now();
+  const elapsed = (Date.now() - faceStartedAt) / 1000;
+  if (!p?.total || p.done <= 2 || elapsed < 5) {
+    faceEta.value = "";
+    return;
+  }
+  const remain = ((p.total - p.done) * elapsed) / p.done;
+  faceEta.value =
+    remain > 90 ? `约 ${Math.round(remain / 60)} 分钟` : `约 ${Math.max(1, Math.round(remain))} 秒`;
+}
+function resetFaceEta() {
+  faceStartedAt = 0;
+  faceEta.value = "";
+}
+
+async function bindFaceEvents() {
+  faceUnlisten.push(
+    await listen("smart-face-progress", (ev) => {
+      faceProgress.value = ev.payload;
+      faceScanning.value = true;
+      updateFaceEta(ev.payload);
+      scheduleClusterRefresh();
+    }),
+  );
+  faceUnlisten.push(
+    await listen("smart-face-done", async (ev) => {
+      const s = ev.payload || {};
+      faceScanning.value = false;
+      faceProgress.value = null;
+      resetFaceEta();
+      if (s.faces > 0) {
+        // 有新面孔：人物册成员也可能变了（已命名簇会自动归入），整页刷新一次
+        await refresh();
+        faceNotice.value = s.cancelled
+          ? `已暂停：本次新增 ${s.faces} 张脸，再点扫描会接着上次继续`
+          : `扫描完成：新增 ${s.faces} 张脸，共 ${s.clusters} 个人脸簇`;
+      } else {
+        await loadFaceClusters(true);
+        if (!s.cancelled) faceNotice.value = "扫描完成：没有发现新的人脸";
+      }
+      loadFaceAutoState();
+    }),
+  );
+  faceUnlisten.push(
+    await listen("smart-face-error", (ev) => {
+      faceScanning.value = false;
+      faceProgress.value = null;
+      resetFaceEta();
+      faceError.value = String(ev.payload || "人脸扫描失败");
+    }),
+  );
+}
+
+async function loadFaceAutoState() {
+  try {
+    const st = await invoke("smart_face_auto_scan_get");
+    if (!st) return;
+    faceConsent.value = st.consent || "ask";
+    faceScanned.value = st.scanned || 0;
+    faceStale.value = st.stale === true;
+    // 打开页面时后台正在扫（自动扫描 / 别处启动）：恢复「进行中」，进度随事件补上
+    if (st.running && !faceScanning.value) {
+      faceScanning.value = true;
+      faceProgress.value = { done: 0, total: 0, faces: 0, current: "后台扫描中" };
+    }
+  } catch {
+    // 读不到就只保留手动扫描，不影响人物册本身
+  }
+}
+
+/** 旧版本结果（256px 缩略图）与新算法不能混算：一次点击清掉重扫 */
+async function clearAndRescan() {
+  const ok = await ask(
+    "将删除现有全部人脸簇与识别结果，再用新算法（640px 原图）重新扫描。\n\n由人脸识别自动加入人物册的照片会被移除，人物册本身与手动关联保留。此操作不可撤销。",
+    { title: "重新扫描人脸", kind: "warning", okLabel: "清除并重扫", cancelLabel: "取消" },
+  );
+  if (!ok) return;
+  faceError.value = "";
+  try {
+    const n = await invoke("smart_face_clear");
+    faceStale.value = false;
+    faceScanned.value = 0;
+    await refresh();
+    faceNotice.value = `已清除 ${n} 条旧结果，开始重新扫描`;
+    await invoke("smart_face_scan");
+  } catch (e) {
+    faceError.value = errMsg(e);
+  }
+}
+
+async function scanFaces() {
+  if (faceScanning.value) return;
+  faceError.value = "";
+  faceNotice.value = "";
+  resetFaceEta();
+  faceStartedAt = Date.now();
+  faceProgress.value = { done: 0, total: 0, faces: 0, current: "准备中" };
+  faceScanning.value = true;
+  try {
+    // 后端立刻返回，真正的进度与结果走 smart-face-* 事件
+    await invoke("smart_face_scan");
+  } catch (e) {
+    const msg = errMsg(e);
+    if (msg.includes("已在运行")) {
+      // 后台自动扫描已排队或在跑：接上它的状态，这不算错误
+      faceProgress.value = null;
+      await loadFaceAutoState();
+      return;
+    }
+    faceScanning.value = false;
+    faceProgress.value = null;
+    faceError.value = msg;
+  }
+}
+
+async function cancelFaceScan() {
+  try {
+    await invoke("smart_face_cancel");
+  } catch (e) {
+    faceError.value = errMsg(e);
+  }
+}
+
+/** 后台自动扫描开关：改设置；打开时若当前没在扫就立刻排一次 */
+async function toggleFaceAuto() {
+  const next = faceAutoOn.value ? "off" : "on";
+  const prev = faceConsent.value;
+  faceConsent.value = next;
+  try {
+    await invoke("smart_set_face_auto_scan", { choice: next });
+    if (next === "on") await invoke("smart_face_auto_start");
+  } catch (e) {
+    faceConsent.value = prev;
+    faceError.value = errMsg(e);
+  }
+}
+
+/** 一键清除人脸数据（生物特征）：二次确认后连自动写入的人物册成员一起清掉 */
+async function clearFaces() {
+  if (faceScanning.value) {
+    faceError.value = "扫描进行中，请先取消再清除";
+    return;
+  }
+  const ok = await ask(
+    "将删除全部人脸检测结果、人脸簇与扫描记录，并从人物册中移除由人脸识别自动加入的照片。\n\n人物册本身和手动关联不受影响。此操作不可撤销。",
+    { title: "清除人脸数据", kind: "warning", okLabel: "清除", cancelLabel: "取消" },
+  );
+  if (!ok) return;
+  try {
+    const n = await invoke("smart_face_clear");
+    faceNotice.value = `已清除 ${n} 条人脸数据`;
+    await refresh();
+    await loadFaceAutoState();
+  } catch (e) {
+    faceError.value = errMsg(e);
+  }
+}
+
+function startNaming(cluster) {
+  namingId.value = cluster.id;
+  namingText.value = "";
+  nextTick(() => {
+    document.querySelector("[data-naming-input]")?.focus();
+  });
+}
+
+/**
+ * 点页面其他地方就收起命名输入框。
+ * 用 pointerdown 捕获阶段判断，而不是给 input 加 blur：点「确定」按钮时 blur 先于
+ * click 触发，blur 方案会把刚输入的内容连同输入框一起关掉。
+ */
+function onDocPointerDown(e) {
+  if (!namingId.value) return;
+  const box = document.querySelector("[data-naming-box]");
+  if (box && e.target instanceof Node && box.contains(e.target)) return;
+  namingId.value = null;
+}
+
+/** 点人脸簇的封面 → 进入详情，看这个人的全部照片（与地点 / 事物相册一致的交互） */
+async function openCluster(c) {
+  listScroll = scroller()?.scrollTop ?? 0;
+  if (view.value !== "detail") lastListView.value = view.value;
+  clusterSel.value = {
+    key: `cluster:${c.id}`,
+    id: c.id,
+    kind: "cluster",
+    label: "待命名人物",
+    subtitle: `${c.count} 张照片`,
+    count: c.count,
+    coverPath: c.coverPath || "",
+  };
+  albumKind.value = "cluster";
+  selectedKey.value = `cluster:${c.id}`;
+  photos.value = [];
+  photosError.value = "";
+  albumNotice.value = "";
+  view.value = "detail";
+  await loadPhotos(clusterSel.value);
+}
+
+async function submitName(cluster) {
+  const name = namingText.value.trim();
+  if (!name || namingBusy.value) return;
+  namingBusy.value = true;
+  faceError.value = "";
+  try {
+    await invoke("smart_face_name", { id: cluster.id, name });
+    namingId.value = null;
+    namingText.value = "";
+    await refresh();
+    flashPersonNotice(`已命名为「${name}」，这些照片已进入人物册`);
+  } catch (e) {
+    faceError.value = errMsg(e);
+  } finally {
+    namingBusy.value = false;
+  }
+}
+
+async function ignoreCluster(cluster) {
+  try {
+    await invoke("smart_face_ignore", { id: cluster.id });
+    await refresh();
+  } catch (e) {
+    faceError.value = errMsg(e);
+  }
+}
+
 async function refresh() {
   loading.value = true;
   error.value = "";
@@ -291,7 +653,7 @@ async function refresh() {
   } finally {
     loading.value = false;
   }
-  await loadPeople();
+  await Promise.all([loadPeople(), loadThings(), loadFaceClusters()]);
   // 详情打开时同步刷新成员（关联 / 取消关联 / 设封面 / 重命名之后）；
   // 相册已被删除（重扫 GPS 或删人物）则清掉失效选中态，不让详情挂在空数据上。
   if (view.value === "detail" && selectedGroup.value) {
@@ -399,6 +761,10 @@ function flashPersonNotice(text, tone = "ok") {
 async function setCover(path) {
   const g = selectedGroup.value;
   if (!g) return;
+  if (albumKind.value === "thing") {
+    flashAlbumNotice("事物分类是自动生成的，不支持设封面", "bad");
+    return;
+  }
   try {
     if (albumKind.value === "person") {
       await invoke("smart_set_person_cover", { id: g.id, path });
@@ -419,6 +785,10 @@ async function setCover(path) {
 async function renameAlbum(name) {
   const g = selectedGroup.value;
   if (!g || !name) return;
+  if (albumKind.value === "thing") {
+    flashAlbumNotice("事物分类是自动生成的，不支持改名", "bad");
+    return;
+  }
   try {
     if (albumKind.value === "person") {
       await invoke("smart_rename_person", { id: g.id, name });
@@ -503,10 +873,24 @@ async function onAlbumAction({ key, path }) {
   }
 }
 
-onMounted(refresh);
+onMounted(async () => {
+  document.addEventListener("pointerdown", onDocPointerDown, true);
+  await bindFaceEvents(); // 先挂事件，避免后台扫描的首批进度丢掉
+  await refresh();
+  await loadFaceAutoState();
+});
 onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", onDocPointerDown, true);
   clearTimeout(noticeTimer);
   clearTimeout(personNoticeTimer);
+  clearTimeout(clusterRefreshTimer);
+  faceUnlisten.forEach((fn) => {
+    try {
+      fn();
+    } catch {
+      // 卸载时的监听器回收失败无需提示
+    }
+  });
 });
 </script>
 
@@ -566,6 +950,15 @@ onBeforeUnmount(() => {
         >
           <Users class="size-4" /> 人物
           <span class="text-[11px] tabular-nums" :class="view === 'person' ? 'text-amber-text' : 'text-ink-3'">{{ peopleLoading ? "…" : people.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="flex h-8 items-center gap-1.5 rounded-md px-3 transition-colors"
+          :class="view === 'thing' ? 'bg-amber-soft font-medium text-ink' : 'text-ink-2 hover:bg-hover'"
+          @click="view = 'thing'"
+        >
+          <Sparkles class="size-4" /> 事物
+          <span class="text-[11px] tabular-nums" :class="view === 'thing' ? 'text-amber-text' : 'text-ink-3'">{{ thingsLoading ? "…" : things.length }}</span>
         </button>
         <button
           type="button"
@@ -667,6 +1060,120 @@ onBeforeUnmount(() => {
 
     <!-- 人物段（§36）：三段统计卡已删（数字在分段按钮 / 段内标题行），一次只铺一段网格 -->
     <template v-if="view === 'person'">
+      <!-- 自动识别（docs §38 人物批）：扫描 → 待命名簇 → 命名 / 忽略 -->
+      <section class="rounded-card border border-line bg-surface p-4 shadow-card">
+        <div class="mb-3 flex flex-wrap items-center gap-2">
+          <h2 class="text-sm font-medium">自动识别</h2>
+          <span class="text-[11px] text-ink-2">{{ faceClusters.length }} 个待命名</span>
+          <span v-if="faceScanned" class="text-[11px] text-ink-3">已扫 {{ faceScanned.toLocaleString() }} 张</span>
+          <div class="ml-auto flex items-center gap-2">
+            <label
+              class="flex cursor-pointer select-none items-center gap-1.5 rounded-lg border border-line px-2 py-1 text-[11px] transition-colors hover:bg-hover"
+              :class="faceAutoOn ? 'text-ink' : 'text-ink-3'"
+              :title="faceAutoOn ? '启动约 20 秒后自动扫描新照片' : '只在你点「扫描人脸」时扫描'"
+            >
+              <input
+                type="checkbox"
+                class="size-3 shrink-0"
+                style="accent-color: var(--color-amber)"
+                :checked="faceAutoOn"
+                @change="toggleFaceAuto"
+              />
+              后台自动扫描
+            </label>
+            <button
+              v-if="faceScanned"
+              class="flex h-7 items-center gap-1 rounded-lg border border-line px-2 text-[11px] text-ink-3 transition-colors hover:bg-hover hover:text-bad disabled:opacity-50"
+              :disabled="faceScanning"
+              @click="clearFaces"
+            ><Trash2 class="size-3" /> 清除人脸数据</button>
+            <button
+              v-if="faceScanning"
+              class="flex h-7 items-center gap-1 rounded-lg border border-line px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
+              @click="cancelFaceScan"
+            ><X class="size-3.5" /> 取消</button>
+            <button
+              v-else
+              class="flex h-8 items-center gap-1.5 rounded-lg bg-amber px-3 text-xs font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
+              :disabled="faceLoading || faceStale"
+              :title="faceStale ? '旧结果需先清除（用左侧「清除并重扫」）' : '扫描全库人脸，可随时取消'"
+              @click="scanFaces"
+            ><ScanSearch class="size-3.5" /> 扫描人脸</button>
+          </div>
+        </div>
+
+        <p v-if="faceError" class="mb-2 flex items-center gap-1.5 rounded-lg bg-bad-soft px-3 py-2 text-xs text-bad">
+          <TriangleAlert class="size-3.5 shrink-0" /> {{ faceError }}
+        </p>
+        <div
+          v-else-if="faceStale"
+          class="mb-2 flex flex-wrap items-center gap-2 rounded-lg bg-amber-soft px-3 py-2 text-xs text-ink-2"
+        >
+          <TriangleAlert class="size-3.5 shrink-0 text-amber" />
+          <span class="min-w-0 flex-1 leading-5">
+            识别算法已升级（改用 640px 原图 + 人脸封面），旧结果会把不同的人聚在一起。清除后重扫一次即可。
+          </span>
+          <button
+            class="shrink-0 rounded-md bg-amber px-2 py-1 text-[11px] font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep disabled:opacity-55"
+            :disabled="faceScanning"
+            @click="clearAndRescan"
+          >清除并重扫</button>
+        </div>
+        <p v-else-if="faceNotice" class="mb-2 rounded-lg bg-ok-soft px-3 py-2 text-xs text-ok">{{ faceNotice }}</p>
+
+        <div v-if="faceScanning" class="mb-3">
+          <div class="mb-1 flex items-center justify-between text-[11px] text-ink-2">
+            <span>{{ faceProgress?.total ? `正在扫描 ${faceProgress.done} / ${faceProgress.total}` : "正在准备…" }}</span>
+            <span>已检出 {{ faceProgress?.faces ?? 0 }} 张脸 · 结果实时新增在下方<template v-if="faceEta">，预计还需 {{ faceEta }}</template></span>
+          </div>
+          <div class="h-1.5 overflow-hidden rounded-full bg-subtle">
+            <div class="h-full rounded-full bg-amber transition-[width]" :style="{ width: faceScanPct + '%' }" />
+          </div>
+        </div>
+
+        <div v-if="faceClusters.length" class="grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6">
+          <div v-for="c in faceClusters" :key="c.id" class="overflow-hidden rounded-card border border-line bg-surface">
+            <button
+              type="button"
+              class="relative block aspect-square w-full bg-subtle text-left transition-opacity hover:opacity-90"
+              :title="`查看这个人的 ${c.count} 张照片`"
+              @click="openCluster(c)"
+            >
+              <img v-if="c.coverPath" :src="thumbUrl(c.coverPath)" class="h-full w-full object-cover" alt="" />
+              <span
+                class="absolute bottom-1 right-1 rounded-md px-1.5 py-0.5 text-[11px] text-white"
+                style="background: rgba(30, 26, 22, 0.92)"
+              >{{ c.count }} 张</span>
+            </button>
+            <div class="p-1.5">
+              <div v-if="namingId === c.id" data-naming-box class="flex gap-1">
+                <input
+                  v-model="namingText"
+                  data-naming-input
+                  class="h-7 min-w-0 flex-1 rounded-md border border-line bg-subtle px-1.5 text-[11px] outline-none focus:border-amber"
+                  maxlength="40"
+                  placeholder="名字"
+                  @keyup.enter="submitName(c)"
+                  @keyup.esc="namingId = null"
+                />
+                <button
+                  class="h-7 shrink-0 rounded-md bg-amber px-2 text-[11px] font-medium text-ink disabled:opacity-50"
+                  :disabled="namingBusy"
+                  @click="submitName(c)"
+                >确定</button>
+              </div>
+              <div v-else class="flex items-center justify-between gap-1">
+                <button class="text-[11px] text-ink-2 transition-colors hover:text-ink" @click="startNaming(c)">命名</button>
+                <button class="text-[11px] text-ink-3 transition-colors hover:text-bad" @click="ignoreCluster(c)">忽略</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p v-else-if="!faceScanning && !faceLoading" class="text-xs leading-5 text-ink-2">
+          {{ faceAutoOn ? "还没有识别到人脸。后台扫描会在启动约 20 秒后自动开始，也可以现在手动扫。" : "还没有自动识别的人脸。点「扫描人脸」开始，或勾选上方「后台自动扫描」；只扫描 JPG / PNG / WebP，照片文件不会被修改，人脸数据只存本机。" }}
+        </p>
+      </section>
+
       <section class="rounded-card border border-line bg-surface p-4 shadow-card">
         <div class="mb-3 flex flex-wrap items-center gap-2">
           <h2 class="text-sm font-medium">人物相册</h2>
@@ -730,8 +1237,55 @@ onBeforeUnmount(() => {
         </div>
         <!-- 读取失败时只显示上面的错误条 + 重试，不拿「还没有人物」冒充失败 -->
         <p v-else-if="!peopleError" class="text-xs leading-5 text-ink-2">
-          还没有人物。点「新建人物」建一个，再到「图库」选中照片、右键「关联到人物」把照片加进来；
-          照片文件不会被移动、改名或写回。
+          <template v-if="faceClusters.length">
+            还没有命名的人物。给上面「待命名」里的脸起个名字，照片就会自动归进这个人物册；
+            也可以点「新建人物」手动建一个，再到「图库」选中照片、右键「关联到人物」。
+          </template>
+          <template v-else>
+            还没有人物。点「新建人物」建一个，再到「图库」选中照片、右键「关联到人物」把照片加进来；
+            照片文件不会被移动、改名或写回。
+          </template>
+        </p>
+      </section>
+    </template>
+
+    <!-- 事物段（§38 主体分类）：CLIP 零样本固定标签，自动生成，不重新推理 -->
+    <template v-if="view === 'thing'">
+      <section class="rounded-card border border-line bg-surface p-4 shadow-card">
+        <div class="mb-3 flex flex-wrap items-center gap-2">
+          <h2 class="text-sm font-medium">事物分类</h2>
+          <span class="text-[11px] text-ink-2">
+            {{ things.length }} 个分类 · {{ thingHitCount }} 张已归类 · 只收把握大的，宁缺勿错
+          </span>
+          <div class="ml-auto flex items-center gap-2">
+            <button
+              v-if="thingsError"
+              class="flex h-7 items-center gap-1 rounded-lg border border-line px-2.5 text-xs text-ink-2 transition-colors hover:bg-hover"
+              @click="loadThings"
+            ><RefreshCw class="size-3.5" /> 重试</button>
+          </div>
+        </div>
+
+        <p v-if="thingsError" class="mb-2 flex items-center gap-1.5 rounded-lg bg-bad-soft px-3 py-2 text-xs text-bad">
+          <TriangleAlert class="size-3.5 shrink-0" /> 读取分类失败：{{ thingsError }}
+        </p>
+
+        <div v-if="thingsLoading" class="text-xs text-ink-2">正在生成分类…</div>
+        <div v-else-if="thingGroups.length" class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          <AlbumCard
+            v-for="t in thingGroups"
+            :key="t.key"
+            :title="t.label"
+            :subtitle="t.subtitle"
+            :count="t.count"
+            :cover-path="t.coverPath"
+            :selected="t.key === selectedKey"
+            @select="openAlbum(t, 'thing')"
+          />
+        </div>
+        <p v-else-if="!thingsError" class="text-xs leading-5 text-ink-2">
+          还没有分类。先到「设置 → 智能相册」建立语义索引；已有索引会自动按内容打标签，
+          不需要重新推理。分类来自 CLIP 的固定中文标签，只收把握较大的照片——数字少不代表漏，多为宁可不错。
         </p>
       </section>
     </template>

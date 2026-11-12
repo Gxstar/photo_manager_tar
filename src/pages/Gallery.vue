@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useVirtualizer } from "@tanstack/vue-virtual";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 // 注意：这个 WebView 里 window.confirm 返回的是 Promise（不是布尔），
 // `!confirm(...)` 恒为 false，二次确认会静默失效 → 统一用原生对话框插件
 import { ask } from "@tauri-apps/plugin-dialog";
@@ -239,7 +239,15 @@ const kindCounts = computed(() => {
   return c;
 });
 
+// 语义搜索结果（null = 未启用）。必须早于 displayItems / rows 定义：
+// useVirtualizer 在 setup 阶段会同步读取 count，晚定义会触发 TDZ，整页白屏。
+const semanticHits = ref(null);
 const displayItems = computed(() => {
+  // 语义搜索结果：按相似度顺序展示，忽略类型 / 评分 / 收藏筛选（搜的是「内容」）
+  if (semanticHits.value) {
+    const byPath = new Map(normalItems.value.map((it) => [it.path, it]));
+    return semanticHits.value.map((h) => byPath.get(h.path)).filter(Boolean);
+  }
   const kind = kindFilter.value;
   const rating = ratingFilter.value;
   const fav = favoriteFilter.value;
@@ -308,7 +316,8 @@ watch(displayItems, (list) => {
 // 时间缓存命中时才按「YYYY.MM」分组；无时间的归入「未标注时间」组。
 // 每行带稳定 key：虚拟器尺寸缓存按键（非下标）存取，重排后按行身份重新测量
 const rows = computed(() => {
-  const groupable = store.gallery.timesTotal === 0;
+  // 语义搜索结果按相关度排序，不做月份分组（分组会把排序打散）
+  const groupable = !semanticHits.value && store.gallery.timesTotal === 0;
   const out = [];
   let curKey = null;
   let cells = null;
@@ -712,23 +721,33 @@ const semanticStatus = ref(null); // null = 未检测；数组 = smart_model_sta
 const semanticLoading = ref(false);
 const semanticError = ref("");
 const semanticActionError = ref("");
-const cnclipReady = computed(
-  () => semanticStatus.value?.find((m) => m.key === "cnclip")?.ready === true,
+const cnclip = computed(
+  () => semanticStatus.value?.find((m) => m.key === "cnclip") ?? null,
 );
+const cnclipReady = computed(() => cnclip.value?.ready === true);
+const cnclipIndex = computed(() => cnclip.value?.index ?? null);
 const semanticBadge = computed(() => {
   if (semanticLoading.value) return { text: "检测中", cls: "bg-subtle text-ink-2" };
   if (semanticError.value) return { text: "读取失败", cls: "bg-bad-soft text-bad" };
   if (!semanticStatus.value) return { text: "未检测", cls: "bg-subtle text-ink-2" };
-  return cnclipReady.value
-    ? { text: "已就绪", cls: "bg-ok-soft text-ok" }
-    : { text: "未就绪", cls: "bg-subtle text-ink-2" };
+  if (!cnclipReady.value) return { text: "未下载", cls: "bg-subtle text-ink-2" };
+  const state = cnclipIndex.value?.state;
+  if (state === "stale") return { text: "需重建索引", cls: "bg-amber-soft text-amber" };
+  if (state === "partial") return { text: "部分可用", cls: "bg-info-soft text-info" };
+  if (state === "complete") return { text: "可用", cls: "bg-ok-soft text-ok" };
+  return { text: "已就绪", cls: "bg-ok-soft text-ok" };
 });
 const semanticHint = computed(() => {
   if (semanticLoading.value) return "正在检测模型…";
   if (semanticError.value) return "模型状态不可用，可重试";
-  return cnclipReady.value
-    ? "模型已就绪，中文语义推理待接入"
-    : "下载模型后可用语义搜图";
+  if (!cnclipReady.value) return "下载模型后可用语义搜图";
+  const state = cnclipIndex.value?.state;
+  if (state === "stale") return "模型已变更，索引需重建后才能搜索";
+  // 第一批只做「模型就绪 + 索引状态」，推理在第二批接入：不提供可输入却无结果的假搜索框
+  if (state === "partial" || state === "complete") {
+    return `已索引 ${cnclipIndex.value.indexed} 张，语义搜索待接入`;
+  }
+  return "模型已就绪，索引未建立；推理将在下一批接入";
 });
 
 async function loadSemanticStatus() {
@@ -752,6 +771,68 @@ async function openModels() {
   } catch (e) {
     semanticActionError.value = errMsg(e);
   }
+}
+
+// ── 语义搜索（docs §38）：模型 + 索引都就绪才放开输入，否则仍是门禁 ────────
+const semanticQuery = ref("");
+const semanticSearching = ref(false);
+const semanticSearchError = ref("");
+const semanticEnabled = computed(() => {
+  const state = cnclipIndex.value?.state;
+  return cnclipReady.value && (state === "partial" || state === "complete");
+});
+
+/** 就地建立索引：不跳设置页，进度同时显示在浮层与工具条 */
+const indexing = ref(false);
+const indexDone = ref(0);
+const indexTotal = ref(0);
+
+async function startIndex() {
+  if (indexing.value) return;
+  indexing.value = true;
+  indexDone.value = 0;
+  indexTotal.value = 0;
+  semanticSearchError.value = "";
+  const onProgress = new Channel();
+  onProgress.onmessage = (p) => {
+    indexDone.value = p.done || 0;
+    indexTotal.value = p.total || 0;
+  };
+  try {
+    await invoke("smart_index_start", { onProgress });
+    await loadSemanticStatus();
+  } catch (e) {
+    const msg = errMsg(e);
+    if (!msg.includes("取消")) semanticSearchError.value = msg;
+  } finally {
+    indexing.value = false;
+    indexDone.value = 0;
+    indexTotal.value = 0;
+  }
+}
+
+async function runSemantic() {
+  const q = semanticQuery.value.trim();
+  if (!q || semanticSearching.value) return;
+  semanticSearching.value = true;
+  semanticSearchError.value = "";
+  try {
+    const hits = await invoke("smart_search", { query: q, limit: 120 });
+    semanticHits.value = hits || [];
+    resetSelection();
+    searchOpen.value = false;
+  } catch (e) {
+    semanticSearchError.value = errMsg(e);
+  } finally {
+    semanticSearching.value = false;
+  }
+}
+
+function clearSemantic() {
+  semanticHits.value = null;
+  semanticQuery.value = "";
+  semanticSearchError.value = "";
+  resetSelection();
 }
 
 const searchMatches = computed(() => {
@@ -1549,6 +1630,28 @@ function relDir(item) {
             class="shrink-0 whitespace-nowrap rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
             :title="`只看 ≥${minStars}★ `"
           >≥{{ minStars }}★</span>
+          <span
+            v-if="indexing"
+            class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-info-soft px-1.5 py-0.5 text-[11px] font-medium text-info"
+            :title="`正在建立语义索引 ${indexDone}/${indexTotal}`"
+          >
+            <LoaderCircle class="size-3 animate-spin" />
+            索引 {{ indexDone }}/{{ indexTotal || "…" }}
+          </span>
+          <span
+            v-if="semanticHits"
+            class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-amber-soft px-1.5 py-0.5 text-[11px] font-medium text-amber-text"
+            :title="`语义搜索「${semanticQuery}」，按相似度排序`"
+          >
+            语义「{{ semanticQuery }}」
+            <button
+              class="grid size-4 place-items-center rounded transition-colors hover:bg-amber/10"
+              aria-label="清除语义搜索"
+              @click="clearSemantic"
+            >
+              <X class="size-3" />
+            </button>
+          </span>
           <span class="shrink-0 whitespace-nowrap font-medium">{{ displayItems.length.toLocaleString() }} 项</span>
           <!-- 以下三项可收缩：空间不足时按「进度 → 大小 → 分母」依次让位，
                truncate 成省略号，不会出现半截字被硬裁；「N 项」与星级徽标刚性保留。
@@ -2172,16 +2275,39 @@ function relDir(item) {
           <button class="underline hover:text-ink" @click="clearFilters(); openReview()">清除筛选并查看废片</button>
         </p>
 
-        <!-- 语义搜图门禁（docs §37）：从智能相册页搬来，与文件名搜索共用一个入口 -->
+        <!-- 语义搜图（docs §38）：模型 + 索引就绪后放开输入；否则仍是门禁，不做假搜索框 -->
         <div class="mt-2 border-t border-line pt-2">
           <div class="mb-1.5 flex items-center gap-1.5">
             <span class="text-[11px] font-medium text-ink-2">语义搜图</span>
             <span class="rounded-md px-1.5 py-0.5 text-[10px]" :class="semanticBadge.cls">{{ semanticBadge.text }}</span>
           </div>
-          <div class="flex h-8 items-center gap-2 rounded-lg border border-line bg-subtle px-2 opacity-70">
+
+          <div
+            v-if="semanticEnabled"
+            class="flex h-8 items-center gap-2 rounded-lg border border-line bg-subtle px-2 focus-within:border-amber"
+          >
+            <Search class="size-3.5 shrink-0 text-ink-3" />
+            <input
+              v-model="semanticQuery"
+              type="text"
+              placeholder="搜内容，如：夕阳、猫、海边"
+              class="h-8 min-w-0 flex-1 bg-transparent text-xs text-ink outline-none placeholder:text-ink-3"
+              :disabled="semanticSearching"
+              @keydown.enter="runSemantic"
+            />
+            <span v-if="semanticSearching" class="shrink-0 text-[11px] text-ink-3">搜索中…</span>
+          </div>
+
+          <div v-else class="flex h-8 items-center gap-2 rounded-lg border border-line bg-subtle px-2 opacity-70">
             <Search class="size-3.5 shrink-0 text-ink-3" />
             <span class="truncate text-xs text-ink-2">{{ semanticHint }}</span>
           </div>
+
+          <p v-if="semanticSearchError" class="mt-1.5 text-[11px] leading-4 text-bad">{{ semanticSearchError }}</p>
+          <p v-else-if="semanticEnabled" class="mt-1 px-1 text-[11px] text-ink-3">
+            回车搜索全库，忽略当前筛选与时间分组
+          </p>
+
           <p v-if="semanticError" class="mt-1.5 text-[11px] leading-4 text-bad">
             模型状态读取失败：{{ semanticError }}
             <button class="underline hover:text-ink" @click="loadSemanticStatus">重试</button>
@@ -2193,6 +2319,25 @@ function relDir(item) {
               class="flex h-6 items-center gap-1 rounded-md border border-line px-2 transition-colors hover:bg-hover"
               @click="openModels"
             ><FolderOpen class="size-3" /> 打开模型目录</button>
+          </div>
+          <div v-else-if="!semanticEnabled && !indexing" class="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-ink-2">
+            <span>模型已就绪，还没有索引</span>
+            <button
+              type="button"
+              class="flex h-6 shrink-0 items-center gap-1 rounded-md bg-amber px-2 text-[11px] font-medium text-ink ring-1 ring-inset ring-amber-deep/45 transition-colors hover:bg-amber-deep"
+              @click="startIndex"
+            >
+              建立索引
+            </button>
+          </div>
+          <div v-else-if="indexing" class="mt-1.5 flex items-center gap-2 text-[11px] text-ink-2">
+            <div class="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-subtle">
+              <div
+                class="h-full rounded-full bg-amber transition-[width] duration-200"
+                :style="{ width: indexTotal ? Math.round((indexDone / indexTotal) * 100) + '%' : '0%' }"
+              />
+            </div>
+            <span class="shrink-0 tabular-nums">{{ indexDone }}/{{ indexTotal || "…" }}</span>
           </div>
           <p v-if="semanticActionError" class="mt-1 text-[11px] leading-4 text-bad">{{ semanticActionError }}</p>
         </div>
